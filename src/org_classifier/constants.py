@@ -48,7 +48,7 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("AG",  re.compile(r'\bAG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── European company ────────────────────────────────────────────────
-    ("Societas Europaea", re.compile(r'\bSocietas\s+Europaea\b', re.IGNORECASE)),
+    ("SE", re.compile(r'\bSocietas\s+Europaea\b', re.IGNORECASE)),
     ("SE",  re.compile(r'\bSE(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── Cooperatives ────────────────────────────────────────────────────
@@ -67,9 +67,9 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("Stiftung", re.compile(r'\bStiftung\b', re.IGNORECASE)),
 
     # ── Public entities ─────────────────────────────────────────────────
-    ("Anstalt des öffentlichen Rechts", re.compile(r'\bAnstalt\s+des\s+öffentlichen\s+Rechts\b', re.IGNORECASE)),
+    ("AöR", re.compile(r'\bAnstalt\s+des\s+öffentlichen\s+Rechts\b', re.IGNORECASE)),
     ("AöR",  re.compile(r'\bAöR\b', re.IGNORECASE)),
-    ("Körperschaft des öffentlichen Rechts", re.compile(r'\bKörperschaft\s+des\s+öffentlichen\s+Rechts\b', re.IGNORECASE)),
+    ("KdöR", re.compile(r'\bKörperschaft\s+des\s+öffentlichen\s+Rechts\b', re.IGNORECASE)),
     ("KdöR", re.compile(r'\bKdöR\b', re.IGNORECASE)),
 
     # Betrieb gewerblicher Art / Eigenbetrieb -> BgA (Betrieb gewerblicher Art)
