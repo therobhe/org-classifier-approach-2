@@ -22,11 +22,12 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("KGaA", re.compile(r'\bKGaA\b', re.IGNORECASE)),
 
     # ── Limited liability companies ─────────────────────────────────────
-    ("gemeinnützige GmbH", re.compile(r'\bgemeinnützige\s+GmbH\b', re.IGNORECASE)),
+    ("gGmbH", re.compile(r'\bgemeinnützige\s+GmbH\b', re.IGNORECASE)),
     ("gGmbH",  re.compile(r'\bgGmbH\b', re.IGNORECASE)),
     ("GmbH",   re.compile(r'\bGmbH\b', re.IGNORECASE)),
     ("UG (haftungsbeschränkt)", re.compile(r'\bUG\s*\(haftungsbeschränkt\)', re.IGNORECASE)),
     ("UG",     re.compile(r'\bUG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
+    ("gUG",    re.compile(r'\bgUG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── Partnership long forms (before short KG / OHG) ──────────────────
     ("PartG mbB", re.compile(r'\bPartG\s+mbB\b', re.IGNORECASE)),
@@ -54,10 +55,10 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("eG",  re.compile(r'\beG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── Associations ────────────────────────────────────────────────────
-    # e.V. appears in the wild as: e.V, e.V., e. V., e.V-, e.V,
-    # Require a dot after the 'e' to avoid matching plain "EV".
-    ("e.V.", re.compile(r"\be\s*\.\s*V\.?(?=\s|$|[,;.)\-])", re.IGNORECASE)),
-    ("eingetragener Verein", re.compile(r'\beingetragener\s+Verein\b', re.IGNORECASE)),
+    # e.V. appears in the wild as: e.V, e.V., e. V., e.V-, e.V, e V
+    # Match either a dot or whitespace between 'e' and 'V' (but not no-separator "EV").
+        ("e.V.", re.compile(r"(?-i:\be(?:\s*\.\s*|\s+)V\.?)(?=\s|$|[,;.)\-])", re.IGNORECASE)),
+    ("e.V.", re.compile(r'\beingetragener\s+Verein\b', re.IGNORECASE)),
 
     # ── Foundations (long forms first) ──────────────────────────────────
     ("Stiftung des öffentlichen Rechts", re.compile(r'\bStiftung\s+des\s+öffentlichen\s+Rechts\b', re.IGNORECASE)),
@@ -75,8 +76,8 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
 
     # ── Sole proprietorships ────────────────────────────────────────────
     ("e.K.", re.compile(r'\be\.\s?K\.', re.IGNORECASE)),
-    ("eingetragener Kaufmann",  re.compile(r'\beingetragener\s+Kaufmann\b', re.IGNORECASE)),
-    ("eingetragene Kauffrau",   re.compile(r'\beingetragene\s+Kauffrau\b', re.IGNORECASE)),
+    ("e.K.",  re.compile(r'\beingetragener\s+Kaufmann\b', re.IGNORECASE)),
+    ("e.K.",  re.compile(r'\beingetragene\s+Kauffrau\b', re.IGNORECASE)),
 ]
 
 
@@ -93,5 +94,7 @@ HEURISTIC_KEYWORDS: Dict[str, str] = {
     "bürgerverein": "e.V.",
     "karnevalsverein": "e.V.",
     "schützenverein": "e.V.",
+    "Wohlfahrtsverband": "e.V.",
+    "Gesamtverband": "e.V.",
     "genossenschaft": "eG",
 }
