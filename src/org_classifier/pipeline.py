@@ -14,6 +14,7 @@ from .classifiers.name_extractor import classify_by_name
 from .classifiers.web_search import find_impressum_url
 from .classifiers.impressum import classify_by_impressum
 from .classifiers.heuristic import classify_by_heuristic, classify_as_unknown
+from .party_rules import classify_party
 from .utils import normalize_org_name
 
 logger = logging.getLogger(__name__)
@@ -192,6 +193,20 @@ class ClassificationPipeline:
                     logger.warning(f"Web search failed for '{org_name}': {e}")
         
         # Stage 3: Heuristics
+        # First, check party regex rules (high-confidence, local-only)
+        try:
+            party_match = classify_party(org_name)
+        except Exception:
+            party_match = None
+        if party_match:
+            result = ClassificationResult(
+                organisation_name=org_name,
+                legal_form=party_match.get("legal_form"),
+                confidence=party_match.get("confidence", "high"),
+                source=party_match.get("source", "party_regex_rule"),
+            )
+            self.cache.set(result)
+            return result
         result = classify_by_heuristic(org_name)
         if result:
             self.cache.set(result)

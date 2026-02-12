@@ -55,9 +55,9 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("eG",  re.compile(r'\beG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── Associations ────────────────────────────────────────────────────
-    # e.V. appears in the wild as: e.V, e.V., e. V., e.V-, e.V, e V
+    # e.V. appears in the wild as: e.V, e.V., e. V., e.V-, e.V, e V and all occurances of small e big V without space between
     # Match either a dot or whitespace between 'e' and 'V' (but not no-separator "EV").
-        ("e.V.", re.compile(r"(?-i:\be(?:\s*\.\s*|\s+)V\.?)(?=\s|$|[,;.)\-])", re.IGNORECASE)),
+    ("e.V.", re.compile(r"\be\s*\.?\s*v\.?(?=\b|[^a-zA-Z])", re.IGNORECASE)),
     ("e.V.", re.compile(r'\beingetragener\s+Verein\b', re.IGNORECASE)),
 
     # ── Foundations (long forms first) ──────────────────────────────────
@@ -72,7 +72,7 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("KdöR", re.compile(r'\bKdöR\b', re.IGNORECASE)),
 
     # Betrieb gewerblicher Art / Eigenbetrieb -> BgA (Betrieb gewerblicher Art)
-    ("BgA", re.compile(r"\b(?:Eigenbetrieb|Betrieb\s+gewerblicher\s+Art)\b", re.IGNORECASE)),
+    ("BgA", re.compile(r"\b(?:Eigenbetrieb|Betrieb\s+gewerblicher\s+Art|\bBgA\b)\b", re.IGNORECASE)),
 
     # ── Sole proprietorships ────────────────────────────────────────────
     ("e.K.", re.compile(r'\be\.\s?K\.', re.IGNORECASE)),
