@@ -25,6 +25,7 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("gGmbH", re.compile(r'\bgemeinnützige\s+GmbH\b', re.IGNORECASE)),
     ("gGmbH",  re.compile(r'\bgGmbH\b', re.IGNORECASE)),
     ("GmbH",   re.compile(r'\bGmbH\b', re.IGNORECASE)),
+    ("mbH",   re.compile(r'\bmbH\b', re.IGNORECASE)),
     ("UG (haftungsbeschränkt)", re.compile(r'\bUG\s*\(haftungsbeschränkt\)', re.IGNORECASE)),
     ("UG",     re.compile(r'\bUG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
     ("gUG",    re.compile(r'\bgUG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
@@ -43,7 +44,7 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("GbR", re.compile(r'\bGbR\b', re.IGNORECASE)),
 
     # ── Stock corporations ──────────────────────────────────────────────
-    ("Aktiengesellschaft", re.compile(r'\bAktiengesellschaft\b', re.IGNORECASE)),
+    ("AG", re.compile(r'\bAktiengesellschaft\b', re.IGNORECASE)),
     ("AG",  re.compile(r'\bAG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── European company ────────────────────────────────────────────────
