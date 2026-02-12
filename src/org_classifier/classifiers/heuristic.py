@@ -19,6 +19,16 @@ def classify_by_heuristic(organisation_name: str) -> Optional[ClassificationResu
                 source="heuristic"
             )
     
+    # Conservative fallback: if the name contains the substring 'verein' assume e.V. (low confidence).
+    # This intentionally matches compounds like 'Sportverein' as well as 'Verein XYZ'.
+    if any(sub in name_lower for sub in ("verein", "vereins")):
+        return ClassificationResult(
+            organisation_name=organisation_name,
+            legal_form="e.V.",
+            confidence="low",
+            source="heuristic_verein",
+        )
+
     return None
 
 

@@ -33,6 +33,17 @@ TESTS = [
     ("Continental AG", "AG"),
     ("Talanx AG", "AG"),
     ("Adidas AG", "AG"),
+
+    # e.V. variants seen in real-world data
+    ("Beispielverein e.V", "e.V."),
+    ("Beispielverein e.V.", "e.V."),
+    ("Beispielverein e. V.", "e.V."),
+    ("Beispielverein e.V- Kulturinitiative", "e.V."),
+    ("Beispielverein e.V,", "e.V."),
+    
+    # BgA variants
+    ("Städtischer Eigenbetrieb Musterstadt", "BgA"),
+    ("Musterstadt - Betrieb gewerblicher Art", "BgA"),
 ]
 
 def match(name):

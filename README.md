@@ -19,6 +19,18 @@ org-classifier input.csv output.csv --offline
 
 # Process with web search (slower, better coverage)
 org-classifier input.csv output.csv
+
+# Quick (no install) — run the module (options before files): options must come before positional args
+python -m src.org_classifier.main --clear-cache --offline .\input_src.csv .\enriched_output.csv
+
+# activate venv first (if not already active)
+.\.venv\Scripts\Activate.ps1
+
+# upgrade pip and install editable package (creates org-classifier script)
+python -m pip install --upgrade pip
+python -m pip install -e .
+# then run the console script
+org-classifier .\input_src.csv .\enriched_output.csv --clear-cache --offline
 ```
 
 See **[QUICKSTART.md](QUICKSTART.md)** for detailed usage examples.
