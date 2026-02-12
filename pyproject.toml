@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "org-classifier"
+version = "0.1.0"
+description = "German legal-form classification pipeline"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "httpx>=0.24.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=4.9.0",
+    "pandas>=2.0.0",
+    "diskcache>=5.6.0",
+    "googlesearch-python>=1.2.0",
+    "tenacity>=8.2.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "typer>=0.9.0",
+]
+
+[project.scripts]
+org-classifier = "org_classifier.main:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
