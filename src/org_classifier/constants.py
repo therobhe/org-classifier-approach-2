@@ -54,7 +54,9 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("eG",  re.compile(r'\beG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── Associations ────────────────────────────────────────────────────
-    ("e.V.", re.compile(r'\be\.\s?V\.', re.IGNORECASE)),
+    # e.V. appears in the wild as: e.V, e.V., e. V., e.V-, e.V,
+    # Require a dot after the 'e' to avoid matching plain "EV".
+    ("e.V.", re.compile(r"\be\s*\.\s*V\.?(?=\s|$|[,;.)\-])", re.IGNORECASE)),
     ("eingetragener Verein", re.compile(r'\beingetragener\s+Verein\b', re.IGNORECASE)),
 
     # ── Foundations (long forms first) ──────────────────────────────────
@@ -67,6 +69,9 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("AöR",  re.compile(r'\bAöR\b', re.IGNORECASE)),
     ("Körperschaft des öffentlichen Rechts", re.compile(r'\bKörperschaft\s+des\s+öffentlichen\s+Rechts\b', re.IGNORECASE)),
     ("KdöR", re.compile(r'\bKdöR\b', re.IGNORECASE)),
+
+    # Betrieb gewerblicher Art / Eigenbetrieb -> BgA (Betrieb gewerblicher Art)
+    ("BgA", re.compile(r"\b(?:Eigenbetrieb|Betrieb\s+gewerblicher\s+Art)\b", re.IGNORECASE)),
 
     # ── Sole proprietorships ────────────────────────────────────────────
     ("e.K.", re.compile(r'\be\.\s?K\.', re.IGNORECASE)),
