@@ -111,7 +111,7 @@ def classify_party(org_name: str) -> Optional[Dict[str, str]]:
             return {
                 "legal_form": "Partei",
                 "confidence": "medium",
-                "source": "heuristic",
+                "source": "heuristic_partei",
                 "matched_party": label,
             }
     return None
