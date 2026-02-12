@@ -22,11 +22,13 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("KGaA", re.compile(r'\bKGaA\b', re.IGNORECASE)),
 
     # ── Limited liability companies ─────────────────────────────────────
-    ("gemeinnützige GmbH", re.compile(r'\bgemeinnützige\s+GmbH\b', re.IGNORECASE)),
+    ("gGmbH", re.compile(r'\bgemeinnützige\s+GmbH\b', re.IGNORECASE)),
     ("gGmbH",  re.compile(r'\bgGmbH\b', re.IGNORECASE)),
     ("GmbH",   re.compile(r'\bGmbH\b', re.IGNORECASE)),
+    ("mbH",   re.compile(r'\bmbH\b', re.IGNORECASE)),
     ("UG (haftungsbeschränkt)", re.compile(r'\bUG\s*\(haftungsbeschränkt\)', re.IGNORECASE)),
     ("UG",     re.compile(r'\bUG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
+    ("gUG",    re.compile(r'\bgUG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── Partnership long forms (before short KG / OHG) ──────────────────
     ("PartG mbB", re.compile(r'\bPartG\s+mbB\b', re.IGNORECASE)),
@@ -42,11 +44,11 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("GbR", re.compile(r'\bGbR\b', re.IGNORECASE)),
 
     # ── Stock corporations ──────────────────────────────────────────────
-    ("Aktiengesellschaft", re.compile(r'\bAktiengesellschaft\b', re.IGNORECASE)),
+    ("AG", re.compile(r'\bAktiengesellschaft\b', re.IGNORECASE)),
     ("AG",  re.compile(r'\bAG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── European company ────────────────────────────────────────────────
-    ("Societas Europaea", re.compile(r'\bSocietas\s+Europaea\b', re.IGNORECASE)),
+    ("SE", re.compile(r'\bSocietas\s+Europaea\b', re.IGNORECASE)),
     ("SE",  re.compile(r'\bSE(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── Cooperatives ────────────────────────────────────────────────────
@@ -54,8 +56,10 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("eG",  re.compile(r'\beG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── Associations ────────────────────────────────────────────────────
-    ("e.V.", re.compile(r'\be\.\s?V\.', re.IGNORECASE)),
-    ("eingetragener Verein", re.compile(r'\beingetragener\s+Verein\b', re.IGNORECASE)),
+    # e.V. appears in the wild as: e.V, e.V., e. V., e.V-, e.V, e V and all occurances of small e big V without space between
+    # Match either a dot or whitespace between 'e' and 'V' (but not no-separator "EV").
+    ("e.V.", re.compile(r"\be\s*\.?\s*v\.?(?=\b|[^a-zA-Z])", re.IGNORECASE)),
+    ("e.V.", re.compile(r'\beingetragener\s+Verein\b', re.IGNORECASE)),
 
     # ── Foundations (long forms first) ──────────────────────────────────
     ("Stiftung des öffentlichen Rechts", re.compile(r'\bStiftung\s+des\s+öffentlichen\s+Rechts\b', re.IGNORECASE)),
@@ -63,15 +67,18 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("Stiftung", re.compile(r'\bStiftung\b', re.IGNORECASE)),
 
     # ── Public entities ─────────────────────────────────────────────────
-    ("Anstalt des öffentlichen Rechts", re.compile(r'\bAnstalt\s+des\s+öffentlichen\s+Rechts\b', re.IGNORECASE)),
+    ("AöR", re.compile(r'\bAnstalt\s+des\s+öffentlichen\s+Rechts\b', re.IGNORECASE)),
     ("AöR",  re.compile(r'\bAöR\b', re.IGNORECASE)),
-    ("Körperschaft des öffentlichen Rechts", re.compile(r'\bKörperschaft\s+des\s+öffentlichen\s+Rechts\b', re.IGNORECASE)),
+    ("KdöR", re.compile(r'\bKörperschaft\s+des\s+öffentlichen\s+Rechts\b', re.IGNORECASE)),
     ("KdöR", re.compile(r'\bKdöR\b', re.IGNORECASE)),
+
+    # Betrieb gewerblicher Art / Eigenbetrieb -> BgA (Betrieb gewerblicher Art)
+    ("BgA", re.compile(r"\b(?:Eigenbetrieb|Betrieb\s+gewerblicher\s+Art|\bBgA\b)\b", re.IGNORECASE)),
 
     # ── Sole proprietorships ────────────────────────────────────────────
     ("e.K.", re.compile(r'\be\.\s?K\.', re.IGNORECASE)),
-    ("eingetragener Kaufmann",  re.compile(r'\beingetragener\s+Kaufmann\b', re.IGNORECASE)),
-    ("eingetragene Kauffrau",   re.compile(r'\beingetragene\s+Kauffrau\b', re.IGNORECASE)),
+    ("e.K.",  re.compile(r'\beingetragener\s+Kaufmann\b', re.IGNORECASE)),
+    ("e.K.",  re.compile(r'\beingetragene\s+Kauffrau\b', re.IGNORECASE)),
 ]
 
 
@@ -88,5 +95,7 @@ HEURISTIC_KEYWORDS: Dict[str, str] = {
     "bürgerverein": "e.V.",
     "karnevalsverein": "e.V.",
     "schützenverein": "e.V.",
+    "Wohlfahrtsverband": "e.V.",
+    "Gesamtverband": "e.V.",
     "genossenschaft": "eG",
 }
