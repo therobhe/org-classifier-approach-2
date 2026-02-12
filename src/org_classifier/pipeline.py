@@ -293,37 +293,52 @@ class ClassificationPipeline:
         
         # Log statistics
         self._log_statistics(results)
+
+        # Append the same statistics to the output CSV for downstream consumption.
+        try:
+            stats = self._compute_statistics(results)
+            # Append a blank line then a machine-friendly semicolon-separated block.
+            with output_path.open("a", encoding="utf-8-sig", newline="") as f:
+                f.write("\n# Classification Statistics\n")
+                f.write(f"Total;{stats['total']}\n")
+
+                f.write("\nBy confidence;count;percent\n")
+                for conf, count in stats["by_confidence"].items():
+                    pct = (count / stats["total"]) * 100 if stats["total"] else 0.0
+                    f.write(f"{conf};{count};{pct:.1f}%\n")
+
+                f.write("\nBy source;count;percent\n")
+                for src, count in stats["by_source"].items():
+                    pct = (count / stats["total"]) * 100 if stats["total"] else 0.0
+                    f.write(f"{src};{count};{pct:.1f}%\n")
+
+                f.write("\nBy legal_form;count;percent\n")
+                for lf, count in stats["forms_sorted"]:
+                    pct = (count / stats["total"]) * 100 if stats["total"] else 0.0
+                    f.write(f"{lf};{count};{pct:.1f}%\n")
+        except Exception as e:
+            logger.warning(f"Failed to append statistics to CSV: {e}")
     
     def _log_statistics(self, results: List[ClassificationResult]) -> None:
         """Log classification statistics."""
-        total = len(results)
-        by_confidence = {}
-        by_source = {}
-        by_legal_form = {}
-        
-        for result in results:
-            conf = result.confidence
-            src = result.source or "unknown"
-            lf = result.legal_form or "null"
-            by_confidence[conf] = by_confidence.get(conf, 0) + 1
-            by_source[src] = by_source.get(src, 0) + 1
-            by_legal_form[lf] = by_legal_form.get(lf, 0) + 1
-        
+        stats = self._compute_statistics(results)
+        total = stats["total"]
+
         logger.info(f"\nClassification Statistics:")
         logger.info(f"Total organisations: {total}")
+
         logger.info(f"\nBy confidence:")
-        for conf, count in sorted(by_confidence.items()):
+        for conf, count in sorted(stats["by_confidence"].items()):
             pct = (count / total) * 100
             logger.info(f"  {conf}: {count} ({pct:.1f}%)")
-        
+
         logger.info(f"\nBy source:")
-        for src, count in sorted(by_source.items()):
+        for src, count in sorted(stats["by_source"].items()):
             pct = (count / total) * 100
             logger.info(f"  {src}: {count} ({pct:.1f}%)")
 
-        # Terminal-friendly Rechtsform distribution
         logger.info(f"\nBy legal form:")
-        forms_sorted = sorted(by_legal_form.items(), key=lambda kv: (-kv[1], str(kv[0])))
+        forms_sorted = stats["forms_sorted"]
         max_lines = 25
         other_count = 0
         for idx, (lf, count) in enumerate(forms_sorted):
@@ -346,3 +361,28 @@ class ClassificationPipeline:
         if len(forms_sorted) > top_k:
             summary_parts.append("...")
         logger.info("\nResume (top legal forms): " + ", ".join(summary_parts))
+
+    def _compute_statistics(self, results: List[ClassificationResult]) -> dict:
+        """Compute and return classification statistics for reuse and CSV export."""
+        total = len(results)
+        by_confidence = {}
+        by_source = {}
+        by_legal_form = {}
+
+        for result in results:
+            conf = result.confidence
+            src = result.source or "unknown"
+            lf = result.legal_form or "null"
+            by_confidence[conf] = by_confidence.get(conf, 0) + 1
+            by_source[src] = by_source.get(src, 0) + 1
+            by_legal_form[lf] = by_legal_form.get(lf, 0) + 1
+
+        forms_sorted = sorted(by_legal_form.items(), key=lambda kv: (-kv[1], str(kv[0])))
+
+        return {
+            "total": total,
+            "by_confidence": by_confidence,
+            "by_source": by_source,
+            "by_legal_form": by_legal_form,
+            "forms_sorted": forms_sorted,
+        }
