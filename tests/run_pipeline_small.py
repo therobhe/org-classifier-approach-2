@@ -25,13 +25,13 @@ async def run(offline: bool):
         await p.process_csv(INPUT, OUTPUT, org_column='organisation_name')
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Small pipeline smoke test (offline or Gemini online).')
-    parser.add_argument('--online', action='store_true', help='Run with Gemini web classification enabled')
+    parser = argparse.ArgumentParser(description='Small pipeline smoke test (offline or LLM online).')
+    parser.add_argument('--online', action='store_true', help='Run with Gemini/OpenAI web classification enabled')
     args = parser.parse_args()
 
     offline = not args.online
-    if not offline and not settings.gemini_api_key:
-        print('GEMINI_API_KEY is not set. Export it first or run without --online.')
+    if not offline and not (settings.gemini_api_key or settings.openai_api_key):
+        print('No LLM API key set. Configure GEMINI_API_KEY or OPENAI_API_KEY, or run without --online.')
         sys.exit(2)
 
     asyncio.run(run(offline=offline))

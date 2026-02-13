@@ -15,6 +15,13 @@ class Settings(BaseSettings):
     gemini_backoff_base_seconds: float = 1.5
     gemini_backoff_max_seconds: float = 20.0
     gemini_min_interval_seconds: float = 1.2
+    openai_api_key: Optional[str] = None
+    openai_model: str = "gpt-4o-mini"
+    openai_timeout_seconds: float = 30.0
+    openai_max_retries: int = 3
+    openai_backoff_base_seconds: float = 1.5
+    openai_backoff_max_seconds: float = 20.0
+    openai_min_interval_seconds: float = 1.2
     
     model_config = SettingsConfigDict(
         env_file=".env",

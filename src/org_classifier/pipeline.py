@@ -20,6 +20,7 @@ from .party_rules import classify_party
 from .utils import normalize_org_name
 
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
 GEMINI_PROMPT_TEMPLATE = (
     'Find the legal form of the organization "{org_name}". '
@@ -157,6 +158,9 @@ class ClassificationPipeline:
         self._gemini_rate_lock = asyncio.Lock()
         self._last_gemini_request_ts = 0.0
         self._gemini_quota_exhausted = False
+        self._openai_rate_lock = asyncio.Lock()
+        self._last_openai_request_ts = 0.0
+        self._openai_quota_exhausted = False
     
     async def __aenter__(self):
         """Async context manager entry."""
@@ -339,7 +343,139 @@ class ClassificationPipeline:
                 await asyncio.sleep(wait)
             self._last_gemini_request_ts = asyncio.get_running_loop().time()
 
-    def _compute_backoff_delay(self, attempt: int, retry_after: Optional[str] = None) -> float:
+    async def _pace_openai_requests(self) -> None:
+        """Throttle OpenAI calls to reduce 429 likelihood."""
+        min_interval = max(0.0, float(settings.openai_min_interval_seconds))
+        if min_interval <= 0:
+            return
+
+        async with self._openai_rate_lock:
+            now = asyncio.get_running_loop().time()
+            wait = (self._last_openai_request_ts + min_interval) - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_openai_request_ts = asyncio.get_running_loop().time()
+
+    async def _call_openai(self, org_name: str) -> Optional[Dict[str, Any]]:
+        """Call OpenAI API and return parsed {"legal_form": ..., "src": ...} or None."""
+        if self._openai_quota_exhausted:
+            return None
+
+        api_key = settings.openai_api_key
+        if not api_key:
+            return None
+
+        prompt_text = GEMINI_PROMPT_TEMPLATE.format(org_name=org_name)
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": settings.openai_model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": "Return only valid JSON."},
+                {"role": "user", "content": prompt_text},
+            ],
+        }
+        max_retries = max(0, int(settings.openai_max_retries))
+
+        resp: Optional[httpx.Response] = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with self.semaphore:
+                    await self._pace_openai_requests()
+                    resp = await self.http_client.post(
+                        OPENAI_API_URL,
+                        headers=headers,
+                        json=payload,
+                        timeout=float(settings.openai_timeout_seconds),
+                    )
+            except httpx.RequestError as exc:
+                if attempt >= max_retries:
+                    logger.warning(f"OpenAI request failed for '{org_name}' after retries: {exc}")
+                    return None
+                delay = self._compute_backoff_delay(
+                    attempt=attempt,
+                    base=float(settings.openai_backoff_base_seconds),
+                    cap=float(settings.openai_backoff_max_seconds),
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code == 429:
+                response_text = (resp.text or "")[:800]
+                lowered = response_text.lower()
+                if "insufficient_quota" in lowered or "quota" in lowered or "billing" in lowered:
+                    self._openai_quota_exhausted = True
+                    logger.warning(
+                        "OpenAI quota appears exhausted (429/insufficient_quota). "
+                        "Skipping further OpenAI web classification for this run."
+                    )
+                    return None
+
+                if attempt >= max_retries:
+                    logger.warning(f"OpenAI rate-limited for '{org_name}' after retries (429)")
+                    return None
+                delay = self._compute_backoff_delay(
+                    attempt=attempt,
+                    retry_after=resp.headers.get("Retry-After"),
+                    base=float(settings.openai_backoff_base_seconds),
+                    cap=float(settings.openai_backoff_max_seconds),
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if 500 <= resp.status_code <= 599:
+                if attempt >= max_retries:
+                    logger.warning(
+                        f"OpenAI server error for '{org_name}' after retries "
+                        f"(status={resp.status_code})"
+                    )
+                    return None
+                delay = self._compute_backoff_delay(
+                    attempt=attempt,
+                    base=float(settings.openai_backoff_base_seconds),
+                    cap=float(settings.openai_backoff_max_seconds),
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                logger.warning(
+                    f"OpenAI API HTTP error for '{org_name}' "
+                    f"(status={resp.status_code}): {exc.response.text[:300]}"
+                )
+                return None
+            break
+
+        if resp is None:
+            return None
+
+        try:
+            body = resp.json()
+            raw_text = body["choices"][0]["message"]["content"]
+            cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
+            cleaned = re.sub(r"```\s*$", "", cleaned.strip())
+            parsed = json.loads(cleaned)
+            if "legal_form" not in parsed:
+                logger.warning(f"OpenAI response missing 'legal_form' for '{org_name}'")
+                return None
+            return parsed
+        except Exception as exc:
+            logger.warning(f"Failed to parse OpenAI response for '{org_name}': {exc}")
+            return None
+
+    def _compute_backoff_delay(
+        self,
+        attempt: int,
+        retry_after: Optional[str] = None,
+        base: Optional[float] = None,
+        cap: Optional[float] = None,
+    ) -> float:
         """Compute retry delay using Retry-After if present, else exponential backoff + jitter."""
         if retry_after:
             try:
@@ -349,11 +485,17 @@ class ClassificationPipeline:
             except Exception:
                 pass
 
-        base = max(0.1, float(settings.gemini_backoff_base_seconds))
-        cap = max(base, float(settings.gemini_backoff_max_seconds))
-        delay = min(cap, base * (2 ** max(0, attempt)))
+        resolved_base = max(
+            0.1,
+            float(base if base is not None else settings.gemini_backoff_base_seconds),
+        )
+        resolved_cap = max(
+            resolved_base,
+            float(cap if cap is not None else settings.gemini_backoff_max_seconds),
+        )
+        delay = min(resolved_cap, resolved_base * (2 ** max(0, attempt)))
         jitter = random.uniform(0.0, delay * 0.25)
-        return min(cap, delay + jitter)
+        return min(resolved_cap, delay + jitter)
 
     async def _verify_url(self, url: str) -> bool:
         """Verify a URL is reachable via HTTP HEAD (returns True for 2xx)."""
@@ -378,12 +520,19 @@ class ClassificationPipeline:
         Returns a classification result (may be 'unknown' if Gemini or verification fails).
         """
         if not self.offline:
-            # Part 1: Send query to Gemini
-            gemini_result = await self._call_gemini(org_name)
+            # Part 1: Send query to Gemini, then fallback to OpenAI if needed
+            llm_provider = "gemini"
+            llm_result = await self._call_gemini(org_name)
 
-            if gemini_result is not None:
-                legal_form = gemini_result.get("legal_form", "unknown")
-                src = gemini_result.get("src", "none")
+            if llm_result is None:
+                fallback_result = await self._call_openai(org_name)
+                if fallback_result is not None:
+                    llm_provider = "openai"
+                    llm_result = fallback_result
+
+            if llm_result is not None:
+                legal_form = llm_result.get("legal_form", "unknown")
+                src = llm_result.get("src", "none")
 
                 # Part 2, Case 1: Gemini returned unknown / no link
                 is_unknown = (
@@ -400,7 +549,7 @@ class ClassificationPipeline:
                         organisation_name=org_name,
                         legal_form=legal_form if not is_unknown else None,
                         confidence="unknown",
-                        source="gemini",
+                        source=llm_provider,
                         link_to_src=None,
                     )
                     self.cache.set(result)
@@ -415,7 +564,7 @@ class ClassificationPipeline:
                         organisation_name=org_name,
                         legal_form=legal_form,
                         confidence="medium",
-                        source="gemini",
+                        source=llm_provider,
                         link_to_src=src,
                     )
                     self.cache.set(result)
