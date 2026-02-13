@@ -1,19 +1,32 @@
 import asyncio
+import json
+import random
+import re
 import httpx
 import pandas as pd
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import logging
 from tqdm import tqdm
 import csv
 from pandas.errors import ParserError
 
+from .config import settings
 from .models import ClassificationResult
 from .cache import ClassificationCache
 from .classifiers.name_extractor import classify_by_name
 from .classifiers.heuristic import classify_by_heuristic, classify_as_unknown
 from .party_rules import classify_party
 from .utils import normalize_org_name
+
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+GEMINI_PROMPT_TEMPLATE = (
+    'Find the legal form of the organization "{org_name}". '
+    'Return only the following JSON: {{ "legal_form": "<FOUND_RESULT>", "src": "<URL>" }}. '
+    'If unknown, use "unknown" for "legal_form" and "none" for "src". '
+    'Do not invent values, do not hallucinate.'
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +154,9 @@ class ClassificationPipeline:
         self.offline = offline
         self.with_heuristic = with_heuristic
         self.http_client: Optional[httpx.AsyncClient] = None
+        self._gemini_rate_lock = asyncio.Lock()
+        self._last_gemini_request_ts = 0.0
+        self._gemini_quota_exhausted = False
     
     async def __aenter__(self):
         """Async context manager entry."""
@@ -199,22 +215,226 @@ class ClassificationPipeline:
         # Return None to indicate this org needs further processing
         return None
     
+    async def _call_gemini(self, org_name: str) -> Optional[Dict[str, Any]]:
+        """Call Gemini API and return parsed {"legal_form": ..., "src": ...} or None."""
+        if self._gemini_quota_exhausted:
+            return None
+
+        api_key = settings.gemini_api_key
+        if not api_key:
+            logger.warning("GEMINI_API_KEY not configured – skipping Gemini classification")
+            return None
+
+        url = GEMINI_API_URL.format(model=settings.gemini_model)
+        prompt_text = GEMINI_PROMPT_TEMPLATE.format(org_name=org_name)
+        payload = {
+            "contents": [{"parts": [{"text": prompt_text}]}],
+        }
+        headers = {"x-goog-api-key": api_key}
+        max_retries = max(0, int(settings.gemini_max_retries))
+
+        resp: Optional[httpx.Response] = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with self.semaphore:
+                    await self._pace_gemini_requests()
+                    resp = await self.http_client.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=float(settings.gemini_timeout_seconds),
+                    )
+            except httpx.RequestError as exc:
+                if attempt >= max_retries:
+                    logger.warning(f"Gemini request failed for '{org_name}' after retries: {exc}")
+                    return None
+                delay = self._compute_backoff_delay(attempt=attempt)
+                logger.info(
+                    f"Gemini request error for '{org_name}', retrying in {delay:.1f}s "
+                    f"({attempt + 1}/{max_retries})"
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code == 429:
+                response_text = (resp.text or "")[:800]
+                lowered = response_text.lower()
+                if (
+                    "quota" in lowered
+                    or "resource_exhausted" in lowered
+                    or "rate limit exceeded" in lowered
+                    or "billing" in lowered
+                ):
+                    self._gemini_quota_exhausted = True
+                    logger.warning(
+                        "Gemini quota appears exhausted (429/RESOURCE_EXHAUSTED). "
+                        "Skipping further Gemini web classification for this run."
+                    )
+                    return None
+
+                if attempt >= max_retries:
+                    logger.warning(f"Gemini rate-limited for '{org_name}' after retries (429)")
+                    return None
+                delay = self._compute_backoff_delay(attempt=attempt, retry_after=resp.headers.get("Retry-After"))
+                logger.info(
+                    f"Gemini 429 for '{org_name}', backing off {delay:.1f}s "
+                    f"({attempt + 1}/{max_retries})"
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if 500 <= resp.status_code <= 599:
+                if attempt >= max_retries:
+                    logger.warning(
+                        f"Gemini server error for '{org_name}' after retries "
+                        f"(status={resp.status_code})"
+                    )
+                    return None
+                delay = self._compute_backoff_delay(attempt=attempt)
+                logger.info(
+                    f"Gemini server error {resp.status_code} for '{org_name}', "
+                    f"retrying in {delay:.1f}s ({attempt + 1}/{max_retries})"
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                logger.warning(
+                    f"Gemini API HTTP error for '{org_name}' "
+                    f"(status={resp.status_code}): {exc.response.text[:300]}"
+                )
+                return None
+            break
+
+        if resp is None:
+            return None
+
+        try:
+            body = resp.json()
+            raw_text = body["candidates"][0]["content"]["parts"][0]["text"]
+            # Strip optional markdown fences (```json ... ```)
+            cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
+            cleaned = re.sub(r"```\s*$", "", cleaned.strip())
+            parsed = json.loads(cleaned)
+            if "legal_form" not in parsed:
+                logger.warning(f"Gemini response missing 'legal_form' for '{org_name}'")
+                return None
+            return parsed
+        except Exception as exc:
+            logger.warning(f"Failed to parse Gemini response for '{org_name}': {exc}")
+            return None
+
+    async def _pace_gemini_requests(self) -> None:
+        """Throttle Gemini calls to reduce 429 likelihood."""
+        min_interval = max(0.0, float(settings.gemini_min_interval_seconds))
+        if min_interval <= 0:
+            return
+
+        async with self._gemini_rate_lock:
+            now = asyncio.get_running_loop().time()
+            wait = (self._last_gemini_request_ts + min_interval) - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_gemini_request_ts = asyncio.get_running_loop().time()
+
+    def _compute_backoff_delay(self, attempt: int, retry_after: Optional[str] = None) -> float:
+        """Compute retry delay using Retry-After if present, else exponential backoff + jitter."""
+        if retry_after:
+            try:
+                retry_seconds = float(retry_after.strip())
+                if retry_seconds > 0:
+                    return retry_seconds
+            except Exception:
+                pass
+
+        base = max(0.1, float(settings.gemini_backoff_base_seconds))
+        cap = max(base, float(settings.gemini_backoff_max_seconds))
+        delay = min(cap, base * (2 ** max(0, attempt)))
+        jitter = random.uniform(0.0, delay * 0.25)
+        return min(cap, delay + jitter)
+
+    async def _verify_url(self, url: str) -> bool:
+        """Verify a URL is reachable via HTTP HEAD (returns True for 2xx)."""
+        try:
+            resp = await self.http_client.head(url, follow_redirects=True, timeout=10.0)
+            return resp.is_success
+        except Exception:
+            return False
+
     async def classify_organisation_web(self, org_name: str) -> ClassificationResult:
         """
-        Expensive classification using web search / LLM API.
+        Expensive classification using Gemini API.
         Only called for organisations that couldn't be classified by fast methods.
-        
-        Returns a classification result (may be 'unknown' if web search also fails).
+
+        Three-part flow:
+        1) Send query to Gemini API.
+        2) Read the response:
+           - Case 1: legal_form is "unknown" / src is "none" → store as unknown.
+           - Case 2: legal_form and src URL returned → verify the URL.
+        3) Verify URL: if reachable → accept result; otherwise → treat as unknown.
+
+        Returns a classification result (may be 'unknown' if Gemini or verification fails).
         """
-        # Stage 2: Web search + ChatGPT (skip if offline)
         if not self.offline:
-            # TODO: implement the ChatGPT/LLM classification here, using self.http_client for any web requests.
-            # This should:
-            # 1. Call an LLM API with the organisation name
-            # 2. Parse the JSON response { "legal_form": "...", "src": "..." }
-            # 3. Return a ClassificationResult with link_to_src populated
-            pass
-        
+            # Part 1: Send query to Gemini
+            gemini_result = await self._call_gemini(org_name)
+
+            if gemini_result is not None:
+                legal_form = gemini_result.get("legal_form", "unknown")
+                src = gemini_result.get("src", "none")
+
+                # Part 2, Case 1: Gemini returned unknown / no link
+                is_unknown = (
+                    not legal_form
+                    or str(legal_form).strip().lower() == "unknown"
+                )
+                has_no_link = (
+                    not src
+                    or str(src).strip().lower() == "none"
+                )
+
+                if is_unknown or has_no_link:
+                    result = ClassificationResult(
+                        organisation_name=org_name,
+                        legal_form=legal_form if not is_unknown else None,
+                        confidence="unknown",
+                        source="gemini",
+                        link_to_src=None,
+                    )
+                    self.cache.set(result)
+                    return result
+
+                # Part 2, Case 2: legal_form + src URL present → verify
+                # Part 3: Verify the returned URL
+                url_valid = await self._verify_url(src)
+
+                if url_valid:
+                    result = ClassificationResult(
+                        organisation_name=org_name,
+                        legal_form=legal_form,
+                        confidence="medium",
+                        source="gemini",
+                        link_to_src=src,
+                    )
+                    self.cache.set(result)
+                    return result
+                else:
+                    logger.info(
+                        f"URL verification failed for '{org_name}' "
+                        f"(url={src}) – marking as unknown"
+                    )
+                    result = ClassificationResult(
+                        organisation_name=org_name,
+                        legal_form=None,
+                        confidence="unknown",
+                        source=None,
+                        link_to_src=None,
+                    )
+                    self.cache.set(result)
+                    return result
+
         # Stage 3: Fallback to unknown
         result = classify_as_unknown(org_name)
         self.cache.set(result)
@@ -272,15 +492,13 @@ class ClassificationPipeline:
         if unknowns and not self.offline:
             logger.info(f"Pass 2: Web search for {len(unknowns)} unknowns...")
             pbar = tqdm(total=len(unknowns), desc="Web classification") if show_progress else None
-            
-            async def _classify_web_with_progress(name: str) -> ClassificationResult:
+
+            web_results: List[ClassificationResult] = []
+            for name in unknowns:
                 result = await self.classify_organisation_web(name)
+                web_results.append(result)
                 if pbar:
                     pbar.update(1)
-                return result
-            
-            tasks = [_classify_web_with_progress(name) for name in unknowns]
-            web_results = await asyncio.gather(*tasks)
             
             if pbar:
                 pbar.close()
