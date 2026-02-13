@@ -2,7 +2,7 @@ import asyncio
 import openai
 
 async def classify_by_web_search(org_name):
-    prompt = f'Finde die Rechtsform der Organisation "{org_name}". Gib nur folgendes JSON zurück: {{ "legal_form": string, "src": string }}. Wenn unbekannt, nutze "unknown" für "legal_form" und "none" für "src".'
+    prompt = f'Finde die Rechtsform der Organisation "{org_name}". Gib nur folgendes JSON zurück: {{ "legal_form": string, "URL": string }}. Wenn unbekannt, nutze "unknown" für "legal_form" und "none" für "URL".'
     response = await openai.ChatCompletion.acreate(
         model="gpt-4",
         messages=[{"role": "user", "content": prompt}]
