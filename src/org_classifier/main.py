@@ -28,6 +28,7 @@ def _run_classify_sync(
     max_workers: Optional[int],
     cache_dir: Optional[str],
     clear_cache: bool,
+    with_heuristic: bool = False,
 ) -> None:
     async def run():
         pipeline_cache_dir = cache_dir or settings.cache_dir
@@ -37,6 +38,7 @@ def _run_classify_sync(
             cache_dir=pipeline_cache_dir,
             max_concurrent_requests=pipeline_max_workers,
             offline=offline,
+            with_heuristic=with_heuristic
         ) as pipeline:
             if clear_cache:
                 typer.echo("Clearing cache...")
@@ -95,6 +97,11 @@ def main(
         "--clear-cache",
         help="Clear cache before processing",
     ),
+    with_heuristic: bool = typer.Option(
+        False,
+        "--with-heuristic",
+        help="Enable heuristic classification stage",
+    ),
 ):
     """Default command.
 
@@ -124,6 +131,7 @@ def main(
         max_workers=max_workers,
         cache_dir=cache_dir,
         clear_cache=clear_cache,
+        with_heuristic=with_heuristic,
     )
 
 

@@ -11,8 +11,6 @@ from pandas.errors import ParserError
 from .models import ClassificationResult
 from .cache import ClassificationCache
 from .classifiers.name_extractor import classify_by_name
-from .classifiers.web_search import find_impressum_url
-from .classifiers.impressum import classify_by_impressum
 from .classifiers.heuristic import classify_by_heuristic, classify_as_unknown
 from .party_rules import classify_party
 from .utils import normalize_org_name
@@ -135,11 +133,13 @@ class ClassificationPipeline:
         self,
         cache_dir: str = ".cache",
         max_concurrent_requests: int = 5,
-        offline: bool = False
+        offline: bool = False,
+        with_heuristic: bool = False
     ):
         self.cache = ClassificationCache(cache_dir)
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
         self.offline = offline
+        self.with_heuristic = with_heuristic
         self.http_client: Optional[httpx.AsyncClient] = None
     
     async def __aenter__(self):
@@ -159,8 +159,8 @@ class ClassificationPipeline:
         Classify a single organisation through the cascade:
         1. Check cache
         2. Name extraction (regex)
-        3. Web search + Impressum (if not offline)
-        4. Heuristics
+        3. Web search + chat gpt (if not offline)
+        4. Heuristics (if enabled)
         5. Unknown
         """
         # Check cache first
@@ -175,44 +175,31 @@ class ClassificationPipeline:
             self.cache.set(result)
             return result
         
-        # Stage 2: Web search + Impressum (skip if offline)
-        if not self.offline and self.http_client:
-            async with self.semaphore:
-                try:
-                    impressum_url = await find_impressum_url(org_name)
-                    if impressum_url:
-                        result = await classify_by_impressum(
-                            org_name,
-                            impressum_url,
-                            self.http_client
-                        )
-                        if result:
-                            self.cache.set(result)
-                            return result
-                except Exception as e:
-                    logger.warning(f"Web search failed for '{org_name}': {e}")
+        # Stage 2: Web search + chat gpt (skip if offline)
+        # call classify_by_chatgpt()      
         
-        # Stage 3: Heuristics
-        # First, check party regex rules (high-confidence, local-only)
-        try:
-            party_match = classify_party(org_name)
-        except Exception:
-            party_match = None
-        if party_match:
-            result = ClassificationResult(
-                organisation_name=org_name,
-                legal_form=party_match.get("legal_form"),
-                confidence=party_match.get("confidence", "high"),
-                source=party_match.get("source", "party_regex_rule"),
-            )
-            self.cache.set(result)
-            return result
-        result = classify_by_heuristic(org_name)
-        if result:
-            self.cache.set(result)
-            return result
+        # Stage 3: Heuristics (optional)
+        if self.with_heuristic:
+            # Party regex rules (high-confidence, local-only)
+            try:
+                party_match = classify_party(org_name)
+            except Exception:
+                party_match = None
+            if party_match:
+                result = ClassificationResult(
+                    organisation_name=org_name,
+                    legal_form=party_match.get("legal_form"),
+                    confidence=party_match.get("confidence", "high"),
+                    source=party_match.get("source", "party_regex_rule"),
+                )
+                self.cache.set(result)
+                return result
+            result = classify_by_heuristic(org_name)
+            if result:
+                self.cache.set(result)
+                return result
         
-        # Stage 4: Unknown
+        # Stage 4: Classify rest as Unknown
         result = classify_as_unknown(org_name)
         self.cache.set(result)
         return result

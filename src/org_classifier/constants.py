@@ -52,7 +52,7 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("SE",  re.compile(r'\bSE(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── Cooperatives ────────────────────────────────────────────────────
-    ("eingetragene Genossenschaft", re.compile(r'\beingetragene\s+Genossenschaft\b', re.IGNORECASE)),
+    ("eG", re.compile(r'\beingetragene\s+Genossenschaft\b', re.IGNORECASE)),
     ("eG",  re.compile(r'\beG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
 
     # ── Associations ────────────────────────────────────────────────────
