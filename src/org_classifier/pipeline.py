@@ -154,14 +154,13 @@ class ClassificationPipeline:
             await self.http_client.aclose()
         self.cache.close()
     
-    async def classify_organisation(self, org_name: str) -> ClassificationResult:
+    async def classify_organisation_fast(self, org_name: str) -> Optional[ClassificationResult]:
         """
-        Classify a single organisation through the cascade:
-        1. Check cache
-        2. Name extraction (regex)
-        3. Web search + chat gpt (if not offline)
-        4. Heuristics (if enabled)
-        5. Unknown
+        Fast classification using only local methods (cache, regex, party rules).
+        Returns None if the organisation could not be classified.
+        
+        This method is used in the first pass to quickly classify organisations
+        without expensive web searches or API calls.
         """
         # Check cache first
         cached = self.cache.get(org_name)
@@ -169,11 +168,12 @@ class ClassificationPipeline:
             logger.debug(f"Cache hit for: {org_name}")
             return cached
         
-        # Stage 1: Name extraction
+        # Stage 1: Name extraction (regex)
         result = classify_by_name(org_name)
         if result:
             self.cache.set(result)
             return result
+        
         # Party regex rules (high-confidence, local-only)
         try:
             party_match = classify_party(org_name)
@@ -189,46 +189,113 @@ class ClassificationPipeline:
             self.cache.set(result)
             return result
         
-        # Stage 2: Web search + chat gpt (skip if offline)
-        # TODO: implement the chat gpt classification and integrate it here, using self.http_client for any web requests.    
-        
-        # Stage 3: Heuristics (optional)
+        # Optional: Apply heuristics in the fast pass
         if self.with_heuristic:
             result = classify_by_heuristic(org_name)
             if result:
                 self.cache.set(result)
                 return result
         
-        # Stage 4: Classify rest as Unknown
+        # Return None to indicate this org needs further processing
+        return None
+    
+    async def classify_organisation_web(self, org_name: str) -> ClassificationResult:
+        """
+        Expensive classification using web search / LLM API.
+        Only called for organisations that couldn't be classified by fast methods.
+        
+        Returns a classification result (may be 'unknown' if web search also fails).
+        """
+        # Stage 2: Web search + ChatGPT (skip if offline)
+        if not self.offline:
+            # TODO: implement the ChatGPT/LLM classification here, using self.http_client for any web requests.
+            # This should:
+            # 1. Call an LLM API with the organisation name
+            # 2. Parse the JSON response { "legal_form": "...", "src": "..." }
+            # 3. Return a ClassificationResult with link_to_src populated
+            pass
+        
+        # Stage 3: Fallback to unknown
         result = classify_as_unknown(org_name)
         self.cache.set(result)
         return result
+    
+    async def classify_organisation(self, org_name: str) -> ClassificationResult:
+        """
+        Classify a single organisation through the full cascade.
+        This is kept for backward compatibility and single-org classification.
+        """
+        # Try fast classification first
+        result = await self.classify_organisation_fast(org_name)
+        if result:
+            return result
+        
+        # Fall back to web search
+        return await self.classify_organisation_web(org_name)
     
     async def process_batch(
         self,
         org_names: List[str],
         show_progress: bool = True
     ) -> List[ClassificationResult]:
-        """Process a batch of organisations concurrently.
-
-        Uses asyncio.gather to preserve input order (critical for
-        correct index-based merging with the source DataFrame).
+        """Process a batch of organisations using a two-pass approach.
+        
+        Pass 1: Fast local classification (cache + regex + party rules)
+        Pass 2: Expensive web search/LLM only for unknowns
+        
+        This optimizes performance by avoiding unnecessary API calls for
+        organisations that can be classified locally.
         """
-        pbar = tqdm(total=len(org_names), desc="Classifying organisations") if show_progress else None
-
-        async def _classify_with_progress(name: str) -> ClassificationResult:
-            result = await self.classify_organisation(name)
+        # Pass 1: Fast local classification
+        logger.info(f"Pass 1: Fast classification of {len(org_names)} organisations...")
+        classified_results = {}
+        unknowns = []
+        
+        pbar = tqdm(total=len(org_names), desc="Fast classification") if show_progress else None
+        
+        for org_name in org_names:
+            result = await self.classify_organisation_fast(org_name)
+            if result:
+                classified_results[org_name] = result
+            else:
+                unknowns.append(org_name)
+            
             if pbar:
                 pbar.update(1)
-            return result
-
-        tasks = [_classify_with_progress(name) for name in org_names]
-        results = await asyncio.gather(*tasks)
-
+        
         if pbar:
             pbar.close()
-
-        return list(results)
+        
+        logger.info(f"Fast pass: {len(classified_results)} classified, {len(unknowns)} unknowns")
+        
+        # Pass 2: Web search for unknowns only
+        if unknowns and not self.offline:
+            logger.info(f"Pass 2: Web search for {len(unknowns)} unknowns...")
+            pbar = tqdm(total=len(unknowns), desc="Web classification") if show_progress else None
+            
+            async def _classify_web_with_progress(name: str) -> ClassificationResult:
+                result = await self.classify_organisation_web(name)
+                if pbar:
+                    pbar.update(1)
+                return result
+            
+            tasks = [_classify_web_with_progress(name) for name in unknowns]
+            web_results = await asyncio.gather(*tasks)
+            
+            if pbar:
+                pbar.close()
+            
+            # Add web results to classified_results
+            for org_name, result in zip(unknowns, web_results):
+                classified_results[org_name] = result
+        else:
+            # Offline mode or no unknowns: mark remaining as unknown
+            for org_name in unknowns:
+                result = classify_as_unknown(org_name)
+                classified_results[org_name] = result
+        
+        # Preserve input order
+        return [classified_results[name] for name in org_names]
     
     async def process_csv(
         self,

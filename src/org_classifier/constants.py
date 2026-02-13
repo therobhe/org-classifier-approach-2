@@ -34,12 +34,12 @@ LEGAL_FORMS: List[Tuple[str, Pattern]] = [
     ("PartG mbB", re.compile(r'\bPartG\s+mbB\b', re.IGNORECASE)),
     ("Partnerschaftsgesellschaft", re.compile(r'\bPartnerschaftsgesellschaft\b', re.IGNORECASE)),
     ("PartG",  re.compile(r'\bPartG\b', re.IGNORECASE)),
-    ("Kommanditgesellschaft", re.compile(r'\bKommanditgesellschaft\b', re.IGNORECASE)),
     ("Offene Handelsgesellschaft", re.compile(r'\bOffene\s+Handelsgesellschaft\b', re.IGNORECASE)),
     ("Gesellschaft bürgerlichen Rechts", re.compile(r'\bGesellschaft\s+bürgerlichen\s+Rechts\b', re.IGNORECASE)),
 
     # ── Short partnership abbreviations ──────────────────────────────────
     ("OHG", re.compile(r'\bOHG\b', re.IGNORECASE)),
+    ("KG", re.compile(r'\bKommanditgesellschaft\b', re.IGNORECASE)),
     ("KG",  re.compile(r'\bKG(?=\s|$|[,;.)\-])', re.IGNORECASE)),
     ("GbR", re.compile(r'\bGbR\b', re.IGNORECASE)),
 
