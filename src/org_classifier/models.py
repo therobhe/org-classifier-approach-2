@@ -13,3 +13,4 @@ class ClassificationResult(BaseModel):
     legal_form: Optional[str] = None
     confidence: Literal["high", "medium", "low", "unknown"] = "unknown"
     source: Optional[str] = None
+    link_to_src: Optional[str] = None

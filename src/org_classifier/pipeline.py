@@ -174,26 +174,26 @@ class ClassificationPipeline:
         if result:
             self.cache.set(result)
             return result
+        # Party regex rules (high-confidence, local-only)
+        try:
+            party_match = classify_party(org_name)
+        except Exception:
+            party_match = None
+        if party_match:
+            result = ClassificationResult(
+                organisation_name=org_name,
+                legal_form=party_match.get("legal_form"),
+                confidence=party_match.get("confidence", "high"),
+                source=party_match.get("source", "name"),
+            )
+            self.cache.set(result)
+            return result
         
         # Stage 2: Web search + chat gpt (skip if offline)
-        # call classify_by_chatgpt()      
+        # TODO: implement the chat gpt classification and integrate it here, using self.http_client for any web requests.    
         
         # Stage 3: Heuristics (optional)
         if self.with_heuristic:
-            # Party regex rules (high-confidence, local-only)
-            try:
-                party_match = classify_party(org_name)
-            except Exception:
-                party_match = None
-            if party_match:
-                result = ClassificationResult(
-                    organisation_name=org_name,
-                    legal_form=party_match.get("legal_form"),
-                    confidence=party_match.get("confidence", "high"),
-                    source=party_match.get("source", "party_regex_rule"),
-                )
-                self.cache.set(result)
-                return result
             result = classify_by_heuristic(org_name)
             if result:
                 self.cache.set(result)
@@ -262,8 +262,8 @@ class ClassificationPipeline:
         # Classify all organisations
         results = await self.process_batch(org_names)
 
-        # Build a clean output with exactly 4 columns:
-        #   organisation_name | legal_form | confidence | source
+        # Build a clean output with exactly 5 columns:
+        #   organisation_name | legal_form | confidence | source | link_to_src
         # This avoids carrying over junk columns from semicolon-heavy inputs.
         output_df = pd.DataFrame(
             {
@@ -271,6 +271,7 @@ class ClassificationPipeline:
                 "legal_form": [r.legal_form for r in results],
                 "confidence": [r.confidence for r in results],
                 "source": [r.source for r in results],
+                "link_to_src": [r.link_to_src for r in results],
             }
         )
 

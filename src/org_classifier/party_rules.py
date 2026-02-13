@@ -110,8 +110,8 @@ def classify_party(org_name: str) -> Optional[Dict[str, str]]:
         if pattern.search(org_name):
             return {
                 "legal_form": "Partei",
-                "confidence": "medium",
-                "source": "heuristic_partei",
+                "confidence": "high",
+                "source": "name",
                 "matched_party": label,
             }
     return None
