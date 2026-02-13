@@ -1,0 +1,115 @@
+🏗 Pipeline für 63.000 Organisationen
+1️⃣ Input
+
+CSV oder Excel-Datei mit Spalte:
+
+organisation_name
+
+
+Optional: weitere Spalten für Batch-Tracking.
+
+2️⃣ Such-API / SERP-Abfrage
+
+Da wir echte URLs brauchen, nutzen wir eine Such-API:
+
+Bing Search API (Microsoft Azure)
+
+Google Custom Search API
+
+SerpAPI (kostenpflichtig, sehr stabil für Massenabfragen)
+
+Für jede Organisation:
+
+Suche "Organisation_Name Rechtsform"
+
+Hole die Top 5–10 Treffer
+
+Speichere:
+
+URL
+
+Snippet / Seiteninhalt
+
+3️⃣ LLM für Extraktion
+
+Input: die Top-Treffer (URLs + Text) + Organisation-Name
+
+Prompt (deterministisch, temperature=0):
+
+Extrahiere aus den folgenden Webseiten die Rechtsform der Organisation "{NAME}".
+Gib nur folgendes JSON zurück:
+{ "legal_form": string, "src": string }
+Wenn keine verlässliche Quelle gefunden wird, gib "unknown" und "none".
+Achte darauf, dass die URL existiert.
+
+
+LLM analysiert die Inhalte, prüft auf Keywords:
+
+e.V., GmbH, UG, AG, Verein, Stiftung, Genossenschaft
+
+Gibt JSON zurück: { "legal_form": ..., "src": ... }
+
+4️⃣ URL-Validierung
+
+Prüfe jede URL mit HTTP HEAD / GET
+
+Statuscode 200 → gültig
+
+Statuscode ≠ 200 → markiere als none
+
+Optional: prüfe Impressum / Vereinsregisterangabe (regex: „e.V.“, „GmbH“)
+
+So stellst du sicher, dass die Quelle tatsächlich existiert.
+
+5️⃣ Batch-Processing
+
+Batch-Größe: 500–1000 Organisationen
+
+Async Requests (API + HTTP-Check)
+
+Logging + Retry bei Fehlern
+
+JSON direkt in Datei oder DB speichern
+
+6️⃣ Output
+
+Für jede Organisation:
+
+{
+  "organisation_name": "Narrenzunft Bingen",
+  "legal_form": "eingetragener Verein",
+  "src": "https://www.nz-bingen.de/"
+}
+
+
+unknown / none, wenn keine verlässliche Quelle gefunden wurde
+
+JSON validiert → direkt verwendbar für den Professor
+
+7️⃣ Optional: Qualitätskontrolle
+
+Stichprobenprüfung: 1–2% der Datensätze manuell
+
+Prüfe, ob URL erreichbar ist und Rechtsform stimmt
+
+Fehlerquote minimal (<1%)
+
+💡 Vorteile dieser Architektur
+
+Belegbare Quellen – keine halluzinierten URLs
+
+Automatisierbar für 63k Datensätze
+
+JSON-kompatibel für deinen Prompt
+
+Retry / Batch / Logging – stabil für große Datenmengen
+
+Leicht skalierbar – wenn nötig, parallelisieren auf Cloud-Instanzen
+
+⚠️ Hinweis
+
+Ohne Such-API / Webscraping ist dein Ziel (echte URLs) nicht erreichbar
+
+LLM allein reicht nur für Wahrscheinlichkeiten
+
+Mit Search + LLM + URL-Check erreichst du wissenschaftlich belegbare Daten
