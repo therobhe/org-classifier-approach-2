@@ -637,24 +637,103 @@ class ClassificationPipeline:
         
         logger.info(f"Fast pass: {len(classified_results)} classified, {len(unknowns)} unknowns")
         
-        # Pass 2: Web search for unknowns only
+        # Pass 2: Web search for unknowns only (chunked + deduplicated)
         if unknowns and not self.offline:
-            logger.info(f"Pass 2: Web search for {len(unknowns)} unknowns...")
-            pbar = tqdm(total=len(unknowns), desc="Web classification") if show_progress else None
+            # Deduplicate: only query each unique name once
+            unique_unknowns = list(dict.fromkeys(unknowns))
+            duplicates_saved = len(unknowns) - len(unique_unknowns)
+            if duplicates_saved:
+                logger.info(
+                    f"Deduplicated unknowns: {len(unknowns)} → {len(unique_unknowns)} "
+                    f"({duplicates_saved} duplicate API calls avoided)"
+                )
 
-            web_results: List[ClassificationResult] = []
-            for name in unknowns:
-                result = await self.classify_organisation_web(name)
-                web_results.append(result)
-                if pbar:
-                    pbar.update(1)
-            
+            total_unknowns = len(unique_unknowns)
+            target_chunks = 25
+            chunk_size = max(1, (total_unknowns + target_chunks - 1) // target_chunks)
+            chunks = [unique_unknowns[i:i + chunk_size] for i in range(0, total_unknowns, chunk_size)]
+
+            logger.info(
+                f"Pass 2: Web search for {total_unknowns} unique unknowns "
+                f"in {len(chunks)} chunks (chunk_size={chunk_size})..."
+            )
+            pbar = tqdm(total=total_unknowns, desc="Web classification") if show_progress else None
+
+            web_results: Dict[str, ClassificationResult] = {}
+            processed = 0
+            quota_stop = False
+
+            for chunk_idx, chunk in enumerate(chunks, start=1):
+                # Early stop: both providers exhausted
+                if self._gemini_quota_exhausted and self._openai_quota_exhausted:
+                    quota_stop = True
+                    logger.warning(
+                        f"Pass 2 early stop before chunk {chunk_idx}/{len(chunks)}: "
+                        f"both Gemini and OpenAI quota exhausted "
+                        f"({processed}/{total_unknowns} processed)."
+                    )
+                    break
+
+                logger.info(
+                    f"Pass 2 chunk {chunk_idx}/{len(chunks)} start "
+                    f"(size={len(chunk)}, processed={processed}/{total_unknowns})"
+                )
+
+                chunk_classified = 0
+                for name in chunk:
+                    # Check cache first to avoid redundant API calls on resume
+                    cached = self.cache.get(name)
+                    if cached:
+                        web_results[name] = cached
+                        processed += 1
+                        chunk_classified += 1
+                        if pbar:
+                            pbar.update(1)
+                        continue
+
+                    result = await self.classify_organisation_web(name)
+                    web_results[name] = result
+                    processed += 1
+                    chunk_classified += 1
+                    if pbar:
+                        pbar.update(1)
+
+                    # Check quota after each call
+                    if self._gemini_quota_exhausted and self._openai_quota_exhausted:
+                        quota_stop = True
+                        logger.warning(
+                            f"Pass 2 early stop in chunk {chunk_idx}/{len(chunks)} after "
+                            f"{chunk_classified}/{len(chunk)} in chunk "
+                            f"({processed}/{total_unknowns} total)."
+                        )
+                        break
+
+                logger.info(
+                    f"Pass 2 chunk {chunk_idx}/{len(chunks)} done "
+                    f"({chunk_classified}/{len(chunk)} classified; "
+                    f"cumulative {processed}/{total_unknowns})"
+                )
+
+                if quota_stop:
+                    break
+
             if pbar:
                 pbar.close()
-            
-            # Add web results to classified_results
-            for org_name, result in zip(unknowns, web_results):
-                classified_results[org_name] = result
+
+            # Map results back to all unknowns (including duplicates);
+            # any unprocessed names (quota stop) fall back to unknown.
+            for org_name in unknowns:
+                classified_results[org_name] = web_results.get(
+                    org_name, classify_as_unknown(org_name)
+                )
+
+            if quota_stop:
+                remaining = total_unknowns - processed
+                if remaining > 0:
+                    logger.warning(
+                        f"Pass 2 fallback: marked {remaining} remaining organisations "
+                        f"as unknown due to quota exhaustion."
+                    )
         else:
             # Offline mode or no unknowns: mark remaining as unknown
             for org_name in unknowns:
