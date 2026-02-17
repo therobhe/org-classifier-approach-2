@@ -394,6 +394,7 @@ class ClassificationPipeline:
 
         try:
             body = resp.json()
+            grounded_url = self._extract_first_grounded_url(body)
             raw_text = body["candidates"][0]["content"]["parts"][0]["text"]
             # Strip optional markdown fences (```json ... ```)
             cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
@@ -402,10 +403,41 @@ class ClassificationPipeline:
             if "legal_form" not in parsed:
                 logger.warning(f"Gemini response missing 'legal_form' for '{org_name}'")
                 return None
+            if grounded_url:
+                parsed["src"] = grounded_url
             return parsed
         except Exception as exc:
             logger.warning(f"Failed to parse Gemini response for '{org_name}': {exc}")
             return None
+
+    def _extract_first_grounded_url(self, body: Dict[str, Any]) -> Optional[str]:
+        """Extract first grounded URL from Gemini response metadata if present."""
+        try:
+            candidates = body.get("candidates") or []
+            if not candidates:
+                return None
+
+            grounding = candidates[0].get("groundingMetadata") or {}
+            chunks = grounding.get("groundingChunks") or []
+            for chunk in chunks:
+                web = chunk.get("web") or {}
+                uri = web.get("uri")
+                if isinstance(uri, str) and uri.strip():
+                    return uri.strip()
+
+            supports = grounding.get("groundingSupports") or []
+            for item in supports:
+                segment = item.get("segment") or {}
+                source_indices = segment.get("groundingChunkIndices") or []
+                for idx in source_indices:
+                    if isinstance(idx, int) and 0 <= idx < len(chunks):
+                        web = (chunks[idx] or {}).get("web") or {}
+                        uri = web.get("uri")
+                        if isinstance(uri, str) and uri.strip():
+                            return uri.strip()
+        except Exception:
+            return None
+        return None
 
     async def _pace_gemini_requests(self) -> None:
         """Throttle Gemini calls to reduce 429 likelihood."""
