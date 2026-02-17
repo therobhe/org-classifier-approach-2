@@ -2,6 +2,8 @@ import asyncio
 import json
 import random
 import re
+from collections import deque
+from datetime import date
 import httpx
 import pandas as pd
 from pathlib import Path
@@ -10,24 +12,25 @@ import logging
 from tqdm import tqdm
 import csv
 from pandas.errors import ParserError
-
-from .config import settings
-from .models import ClassificationResult
 from .cache import ClassificationCache
+from .models import ClassificationResult
 from .classifiers.name_extractor import classify_by_name
 from .classifiers.heuristic import classify_by_heuristic, classify_as_unknown
 from .party_rules import classify_party
 from .utils import normalize_org_name
+from .config import settings
 
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+# External API endpoints (can be overridden in future by config)
+GEMINI_API_URL = "https://api.generativeai.googleapis.com/v1/models/{model}:generate"
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
 GEMINI_PROMPT_TEMPLATE = (
-    'Find the legal form of the organization "{org_name}". '
-    'Return only the following JSON: {{ "legal_form": "<FOUND_RESULT>", "src": "<URL>" }}. '
-    'If unknown, use "unknown" for "legal_form" and "none" for "src". '
-    'Do not invent values, do not hallucinate.'
+    'Find the legal form of the german organization "{org_name}".'
+    ' Return only the following JSON: {{ "legal_form": "<FOUND_RESULT>", "src": "<URL>" }}.'
+    ' If unknown, use "unknown" for "legal_form" and "none" for "src".'
+    ' Do not invent values, do not hallucinate.'
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +164,12 @@ class ClassificationPipeline:
         self._openai_rate_lock = asyncio.Lock()
         self._last_openai_request_ts = 0.0
         self._openai_quota_exhausted = False
+        self._openai_minute_request_timestamps = deque()
+        self._openai_minute_token_events = deque()
+        self._openai_daily_window_key = ""
+        self._openai_requests_today = 0
+        self._openai_tokens_today = 0
+        self._openai_limits_logged = False
     
     async def __aenter__(self):
         """Async context manager entry."""
@@ -234,6 +243,74 @@ class ClassificationPipeline:
         payload = {
             "contents": [{"parts": [{"text": prompt_text}]}],
         }
+        # Apply Gemini generation tuning.
+        try:
+            media_level = str(settings.gemini_media_resolution or "low").strip().lower()
+            media_map = {
+                "low": "MEDIA_RESOLUTION_LOW",
+                "medium": "MEDIA_RESOLUTION_MEDIUM",
+                "high": "MEDIA_RESOLUTION_HIGH",
+            }
+            media_resolution = media_map.get(media_level, "MEDIA_RESOLUTION_LOW")
+
+            thinking_level = str(settings.gemini_thinking_level or "low").strip().lower()
+            thinking_budget_map = {
+                "low": 0,
+                "medium": 256,
+                "high": 1024,
+            }
+            thinking_budget = thinking_budget_map.get(thinking_level, 0)
+
+            payload["generationConfig"] = {
+                "mediaResolution": media_resolution,
+                "thinkingConfig": {"thinkingBudget": thinking_budget},
+            }
+        except Exception:
+            # Conservative fallback: continue without generation tuning.
+            pass
+        # Optionally enable Google Search grounding for Gemini.
+        try:
+            if bool(settings.gemini_use_google_search_grounding):
+                payload["tools"] = [{"google_search": {"media_resolution": "low"}}]
+        except Exception:
+            # Proceed without grounding if config parsing fails.
+            pass
+        # Optionally request structured JSON output from Gemini
+        try:
+            if bool(settings.gemini_use_structured_output):
+                # Default schema: legal_form and src string fields
+                if settings.gemini_structured_output_schema:
+                    schema = json.loads(settings.gemini_structured_output_schema)
+                else:
+                    schema = {
+                        "title": "OrgLegalForm",
+                        "type": "object",
+                        "properties": {
+                            "legal_form": {"type": ["string", "null"]},
+                            "src": {"type": ["string", "null"]},
+                        },
+                        "required": [],
+                    }
+
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": schema,
+                }
+        except Exception:
+            # Proceed without structured output if schema parsing fails
+            pass
+        # Optionally include URL context for Gemini if configured.
+        try:
+            if bool(settings.gemini_use_url_context):
+                raw = settings.gemini_url_context_urls or ""
+                urls = [u.strip() for u in str(raw).split(",") if u and u.strip()]
+                # Include an explicit 'context' section expected by the REST API.
+                # The exact shape is conservative and should be adjusted if using
+                # an SDK that requires a different key (e.g., google.genai types).
+                payload["context"] = {"urlContext": {"urls": urls}}
+        except Exception:
+            # Conservative: if config parsing fails, proceed without URL context.
+            pass
         headers = {"x-goog-api-key": api_key}
         max_retries = max(0, int(settings.gemini_max_retries))
 
@@ -356,6 +433,163 @@ class ClassificationPipeline:
                 await asyncio.sleep(wait)
             self._last_openai_request_ts = asyncio.get_running_loop().time()
 
+    def _estimate_text_tokens(self, text: str) -> int:
+        """Rough token estimate using ~4 chars/token heuristic."""
+        return max(1, (len(text or "") + 3) // 4)
+
+    def _resolve_openai_limits(self) -> Tuple[int, int, int, int]:
+        """Resolve effective OpenAI limits with model defaults and optional env overrides."""
+        model = (settings.openai_model or "").strip().lower()
+        defaults = {
+            "gpt-5.1": (10_000, 3, 200, 900_000),
+            "gpt-5-mini": (60_000, 3, 200, 200_000),
+            "gpt-5-nano": (40_000, 3, 200, 200_000),
+        }
+        tpm, rpm, rpd, tpd = defaults.get(model, (40_000, 3, 200, 200_000))
+
+        if settings.openai_tokens_per_minute is not None:
+            tpm = int(settings.openai_tokens_per_minute)
+        if settings.openai_requests_per_minute is not None:
+            rpm = int(settings.openai_requests_per_minute)
+        if settings.openai_requests_per_day is not None:
+            rpd = int(settings.openai_requests_per_day)
+        if settings.openai_tokens_per_day is not None:
+            tpd = int(settings.openai_tokens_per_day)
+
+        margin = min(1.0, max(0.1, float(settings.openai_quota_safety_margin)))
+        tpm = max(1, int(tpm * margin))
+        rpm = max(1, int(rpm * margin))
+        rpd = max(1, int(rpd * margin))
+        tpd = max(1, int(tpd * margin))
+        return tpm, rpm, rpd, tpd
+
+    def _reset_openai_daily_counters_if_needed(self) -> None:
+        """Reset per-day counters when local date changes."""
+        today_key = date.today().isoformat()
+        if self._openai_daily_window_key != today_key:
+            self._openai_daily_window_key = today_key
+            self._openai_requests_today = 0
+            self._openai_tokens_today = 0
+
+    def _prune_openai_minute_windows(self, now_ts: float) -> None:
+        """Drop request/token events older than 60 seconds."""
+        cutoff = now_ts - 60.0
+        while self._openai_minute_request_timestamps and self._openai_minute_request_timestamps[0] < cutoff:
+            self._openai_minute_request_timestamps.popleft()
+        while self._openai_minute_token_events and self._openai_minute_token_events[0][0] < cutoff:
+            self._openai_minute_token_events.popleft()
+
+    async def _wait_for_openai_capacity(self, estimated_total_tokens: int) -> bool:
+        """Wait until OpenAI quotas allow a request; return False on hard daily/size limits."""
+        if self._openai_quota_exhausted:
+            return False
+
+        tpm, rpm, rpd, tpd = self._resolve_openai_limits()
+        if estimated_total_tokens > tpm:
+            logger.warning(
+                "OpenAI request estimate (%s tokens) exceeds effective TPM (%s). "
+                "Reduce OPENAI_MAX_COMPLETION_TOKENS or prompt size.",
+                estimated_total_tokens,
+                tpm,
+            )
+            return False
+        if estimated_total_tokens > tpd:
+            logger.warning(
+                "OpenAI request estimate (%s tokens) exceeds effective TPD (%s).",
+                estimated_total_tokens,
+                tpd,
+            )
+            return False
+
+        if not self._openai_limits_logged:
+            logger.info(
+                "OpenAI limiter active for model '%s': TPM=%s RPM=%s RPD=%s TPD=%s (safety_margin=%.2f)",
+                settings.openai_model,
+                tpm,
+                rpm,
+                rpd,
+                tpd,
+                min(1.0, max(0.1, float(settings.openai_quota_safety_margin))),
+            )
+            self._openai_limits_logged = True
+
+        wait_enabled = bool(settings.openai_wait_for_capacity_window)
+        min_interval = max(0.0, float(settings.openai_min_interval_seconds))
+
+        while True:
+            now = asyncio.get_running_loop().time()
+            self._reset_openai_daily_counters_if_needed()
+            self._prune_openai_minute_windows(now)
+
+            if self._openai_requests_today >= rpd:
+                self._openai_quota_exhausted = True
+                logger.warning(
+                    "OpenAI daily request limit reached (%s/%s). Skipping further OpenAI calls for this run.",
+                    self._openai_requests_today,
+                    rpd,
+                )
+                return False
+
+            if (self._openai_tokens_today + estimated_total_tokens) > tpd:
+                self._openai_quota_exhausted = True
+                logger.warning(
+                    "OpenAI daily token limit reached (%s + %s > %s). "
+                    "Skipping further OpenAI calls for this run.",
+                    self._openai_tokens_today,
+                    estimated_total_tokens,
+                    tpd,
+                )
+                return False
+
+            req_in_minute = len(self._openai_minute_request_timestamps)
+            tok_in_minute = sum(tokens for _, tokens in self._openai_minute_token_events)
+
+            interval_wait = max(0.0, (self._last_openai_request_ts + min_interval) - now)
+            rpm_wait = 0.0
+            if req_in_minute >= rpm:
+                rpm_wait = max(0.0, (self._openai_minute_request_timestamps[0] + 60.0) - now)
+
+            tpm_wait = 0.0
+            if (tok_in_minute + estimated_total_tokens) > tpm:
+                if self._openai_minute_token_events:
+                    tpm_wait = max(0.0, (self._openai_minute_token_events[0][0] + 60.0) - now)
+                else:
+                    tpm_wait = 60.0
+
+            required_wait = max(interval_wait, rpm_wait, tpm_wait)
+            if required_wait <= 0.0:
+                self._openai_minute_request_timestamps.append(now)
+                self._openai_minute_token_events.append((now, estimated_total_tokens))
+                self._openai_requests_today += 1
+                self._openai_tokens_today += estimated_total_tokens
+                self._last_openai_request_ts = now
+                return True
+
+            if not wait_enabled:
+                logger.warning(
+                    "OpenAI capacity window exceeded (RPM/TPM). "
+                    "Set OPENAI_WAIT_FOR_CAPACITY_WINDOW=true to queue instead of skipping."
+                )
+                return False
+
+            await asyncio.sleep(max(0.05, min(required_wait, 5.0)))
+
+    def _release_openai_reserved_tokens(self) -> None:
+        """Release last reserved OpenAI token event (used for failed/non-billed attempts)."""
+        if not self._openai_minute_token_events:
+            return
+        _, reserved = self._openai_minute_token_events.pop()
+        self._openai_tokens_today = max(0, self._openai_tokens_today - reserved)
+
+    def _adjust_last_openai_reserved_tokens(self, actual_total_tokens: int) -> None:
+        """Adjust last reserved OpenAI token event to actual usage if available."""
+        if actual_total_tokens <= 0 or not self._openai_minute_token_events:
+            return
+        ts, reserved = self._openai_minute_token_events.pop()
+        self._openai_minute_token_events.append((ts, actual_total_tokens))
+        delta = actual_total_tokens - reserved
+        self._openai_tokens_today = max(0, self._openai_tokens_today + delta)
+
     async def _call_openai(self, org_name: str) -> Optional[Dict[str, Any]]:
         """Call OpenAI API and return parsed {"legal_form": ..., "src": ...} or None."""
         if self._openai_quota_exhausted:
@@ -374,25 +608,50 @@ class ClassificationPipeline:
             "model": settings.openai_model,
             "temperature": 0,
             "response_format": {"type": "json_object"},
+            "max_tokens": max(1, int(settings.openai_max_completion_tokens)),
             "messages": [
                 {"role": "system", "content": "Return only valid JSON."},
                 {"role": "user", "content": prompt_text},
             ],
         }
+        estimated_prompt_tokens = (
+            self._estimate_text_tokens("Return only valid JSON.")
+            + self._estimate_text_tokens(prompt_text)
+        )
+        estimated_total_tokens = (
+            estimated_prompt_tokens + max(1, int(settings.openai_max_completion_tokens))
+        )
         max_retries = max(0, int(settings.openai_max_retries))
 
         resp: Optional[httpx.Response] = None
         for attempt in range(max_retries + 1):
             try:
-                async with self.semaphore:
-                    await self._pace_openai_requests()
-                    resp = await self.http_client.post(
-                        OPENAI_API_URL,
-                        headers=headers,
-                        json=payload,
-                        timeout=float(settings.openai_timeout_seconds),
-                    )
+                async with self._openai_rate_lock:
+                    has_capacity = await self._wait_for_openai_capacity(estimated_total_tokens)
+                    if not has_capacity:
+                        return None
+
+                    async with self.semaphore:
+                        resp = await self.http_client.post(
+                            OPENAI_API_URL,
+                            headers=headers,
+                            json=payload,
+                            timeout=float(settings.openai_timeout_seconds),
+                        )
+
+                    if resp.status_code >= 400:
+                        self._release_openai_reserved_tokens()
+                    else:
+                        try:
+                            usage = (resp.json() or {}).get("usage") or {}
+                            actual_total_tokens = int(usage.get("total_tokens") or 0)
+                            self._adjust_last_openai_reserved_tokens(actual_total_tokens)
+                        except Exception:
+                            # Keep reserved estimate if usage is unavailable.
+                            pass
             except httpx.RequestError as exc:
+                async with self._openai_rate_lock:
+                    self._release_openai_reserved_tokens()
                 if attempt >= max_retries:
                     logger.warning(f"OpenAI request failed for '{org_name}' after retries: {exc}")
                     return None
