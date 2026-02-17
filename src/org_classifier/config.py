@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     openai_quota_safety_margin: float = 0.9
     openai_wait_for_capacity_window: bool = True
     openai_max_completion_tokens: int = 120
+    web_batch_size: int = 50
     
     model_config = SettingsConfigDict(
         env_file=".env",

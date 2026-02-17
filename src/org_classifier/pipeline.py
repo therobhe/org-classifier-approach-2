@@ -31,6 +31,16 @@ GEMINI_PROMPT_TEMPLATE = (
     ' Do not invent values, do not hallucinate.'
 )
 
+GEMINI_BATCH_PROMPT_TEMPLATE = (
+    'For each of the following German organizations, find their legal form (Rechtsform).\n'
+    'Input (JSON array):\n{org_list_json}\n\n'
+    'Return ONLY a JSON array where each element has: '
+    '{{ "id": <INPUT_ID>, "legal_form": "<FOUND_RESULT>", "src": "<URL>" }}.\n'
+    'If unknown, use "unknown" for "legal_form" and "none" for "src".\n'
+    'Do not invent values, do not hallucinate.\n'
+    'Return one result per input. Preserve the original "id" values.'
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -799,6 +809,356 @@ class ClassificationPipeline:
         except Exception:
             return False
 
+    async def _call_gemini_batch(self, org_names: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Call Gemini API with a batch of org names and return a dict mapping org_name -> parsed result."""
+        if self._gemini_quota_exhausted:
+            return {}
+
+        api_key = settings.gemini_api_key
+        if not api_key:
+            logger.warning("GEMINI_API_KEY not configured – skipping Gemini batch classification")
+            return {}
+
+        # Build the indexed input list
+        org_list = [{"id": i, "name": name} for i, name in enumerate(org_names)]
+        org_list_json = json.dumps(org_list, ensure_ascii=False)
+
+        url = GEMINI_API_URL.format(model=settings.gemini_model)
+        prompt_text = GEMINI_BATCH_PROMPT_TEMPLATE.format(org_list_json=org_list_json)
+        payload = {
+            "contents": [{"parts": [{"text": prompt_text}]}],
+        }
+        # Apply Gemini generation tuning.
+        try:
+            media_level = str(settings.gemini_media_resolution or "low").strip().lower()
+            media_map = {
+                "low": "MEDIA_RESOLUTION_LOW",
+                "medium": "MEDIA_RESOLUTION_MEDIUM",
+                "high": "MEDIA_RESOLUTION_HIGH",
+            }
+            media_resolution = media_map.get(media_level, "MEDIA_RESOLUTION_LOW")
+
+            thinking_level = str(settings.gemini_thinking_level or "low").strip().lower()
+            thinking_budget_map = {
+                "low": 0,
+                "medium": 256,
+                "high": 1024,
+            }
+            thinking_budget = thinking_budget_map.get(thinking_level, 0)
+
+            payload["generationConfig"] = {
+                "thinkingConfig": {"thinkingBudget": thinking_budget},
+            }
+        except Exception:
+            pass
+
+        # Optionally enable Google Search grounding.
+        try:
+            if bool(settings.gemini_use_google_search_grounding):
+                payload["tools"] = [{"google_search": {}}]
+        except Exception:
+            pass
+
+        headers = {"x-goog-api-key": api_key}
+        max_retries = max(0, int(settings.gemini_max_retries))
+
+        resp: Optional[httpx.Response] = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with self.semaphore:
+                    await self._pace_gemini_requests()
+                    resp = await self.http_client.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=max(60.0, float(settings.gemini_timeout_seconds) * 2),
+                    )
+            except httpx.RequestError as exc:
+                if attempt >= max_retries:
+                    logger.warning(f"Gemini batch request failed after retries: {exc}")
+                    return {}
+                delay = self._compute_backoff_delay(attempt=attempt)
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code == 429:
+                response_text = (resp.text or "")[:800]
+                lowered = response_text.lower()
+                if (
+                    "quota" in lowered
+                    or "resource_exhausted" in lowered
+                    or "rate limit exceeded" in lowered
+                    or "billing" in lowered
+                ):
+                    self._gemini_quota_exhausted = True
+                    logger.warning(
+                        "Gemini quota appears exhausted (429/RESOURCE_EXHAUSTED). "
+                        "Skipping further Gemini batch classification for this run."
+                    )
+                    return {}
+
+                if attempt >= max_retries:
+                    logger.warning("Gemini batch rate-limited after retries (429)")
+                    return {}
+                delay = self._compute_backoff_delay(
+                    attempt=attempt, retry_after=resp.headers.get("Retry-After")
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if 500 <= resp.status_code <= 599:
+                if attempt >= max_retries:
+                    logger.warning(
+                        f"Gemini batch server error after retries (status={resp.status_code})"
+                    )
+                    return {}
+                delay = self._compute_backoff_delay(attempt=attempt)
+                await asyncio.sleep(delay)
+                continue
+
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                logger.warning(
+                    f"Gemini batch API HTTP error (status={resp.status_code}): "
+                    f"{exc.response.text[:300]}"
+                )
+                return {}
+            break
+
+        if resp is None:
+            return {}
+
+        # Parse batch response
+        try:
+            body = resp.json()
+            raw_text = body["candidates"][0]["content"]["parts"][0]["text"]
+            # Strip optional markdown fences
+            cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
+            cleaned = re.sub(r"```\s*$", "", cleaned.strip())
+            parsed = json.loads(cleaned)
+
+            if not isinstance(parsed, list):
+                logger.warning("Gemini batch response is not a JSON array")
+                return {}
+
+            results: Dict[str, Optional[Dict[str, Any]]] = {}
+            for item in parsed:
+                try:
+                    item_id = int(item.get("id", -1))
+                    if 0 <= item_id < len(org_names):
+                        org_name = org_names[item_id]
+                        results[org_name] = {
+                            "legal_form": item.get("legal_form", "unknown"),
+                            "src": item.get("src", "none"),
+                        }
+                except (ValueError, TypeError, AttributeError):
+                    continue
+
+            logger.info(
+                f"Gemini batch: parsed {len(results)}/{len(org_names)} results"
+            )
+            return results
+
+        except Exception as exc:
+            logger.warning(f"Failed to parse Gemini batch response: {exc}")
+            return {}
+
+    async def _call_openai_batch(self, org_names: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Call OpenAI API with a batch of org names and return a dict mapping org_name -> parsed result."""
+        if self._openai_quota_exhausted:
+            return {}
+
+        api_key = settings.openai_api_key
+        if not api_key:
+            return {}
+
+        # Build the indexed input list
+        org_list = [{"id": i, "name": name} for i, name in enumerate(org_names)]
+        org_list_json = json.dumps(org_list, ensure_ascii=False)
+        prompt_text = GEMINI_BATCH_PROMPT_TEMPLATE.format(org_list_json=org_list_json)
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        # Scale max tokens for batch size
+        single_max_tokens = max(1, int(settings.openai_max_completion_tokens))
+        batch_max_tokens = min(single_max_tokens * len(org_names), 16_000)
+        payload = {
+            "model": settings.openai_model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "max_tokens": batch_max_tokens,
+            "messages": [
+                {"role": "system", "content": "Return only valid JSON."},
+                {"role": "user", "content": prompt_text},
+            ],
+        }
+
+        estimated_prompt_tokens = (
+            self._estimate_text_tokens("Return only valid JSON.")
+            + self._estimate_text_tokens(prompt_text)
+        )
+        estimated_total_tokens = estimated_prompt_tokens + batch_max_tokens
+        max_retries = max(0, int(settings.openai_max_retries))
+
+        resp: Optional[httpx.Response] = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with self._openai_rate_lock:
+                    has_capacity = await self._wait_for_openai_capacity(estimated_total_tokens)
+                    if not has_capacity:
+                        return {}
+
+                    async with self.semaphore:
+                        resp = await self.http_client.post(
+                            OPENAI_API_URL,
+                            headers=headers,
+                            json=payload,
+                            timeout=max(60.0, float(settings.openai_timeout_seconds) * 2),
+                        )
+
+                    if resp.status_code >= 400:
+                        self._release_openai_reserved_tokens()
+                    else:
+                        try:
+                            usage = (resp.json() or {}).get("usage") or {}
+                            actual_total_tokens = int(usage.get("total_tokens") or 0)
+                            self._adjust_last_openai_reserved_tokens(actual_total_tokens)
+                        except Exception:
+                            pass
+            except httpx.RequestError as exc:
+                async with self._openai_rate_lock:
+                    self._release_openai_reserved_tokens()
+                if attempt >= max_retries:
+                    logger.warning(f"OpenAI batch request failed after retries: {exc}")
+                    return {}
+                delay = self._compute_backoff_delay(
+                    attempt=attempt,
+                    base=float(settings.openai_backoff_base_seconds),
+                    cap=float(settings.openai_backoff_max_seconds),
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if resp.status_code == 429:
+                response_text = (resp.text or "")[:800]
+                lowered = response_text.lower()
+                if "insufficient_quota" in lowered or "quota" in lowered or "billing" in lowered:
+                    self._openai_quota_exhausted = True
+                    logger.warning(
+                        "OpenAI quota appears exhausted (429). "
+                        "Skipping further OpenAI batch classification for this run."
+                    )
+                    return {}
+                if attempt >= max_retries:
+                    logger.warning("OpenAI batch rate-limited after retries (429)")
+                    return {}
+                delay = self._compute_backoff_delay(
+                    attempt=attempt,
+                    retry_after=resp.headers.get("Retry-After"),
+                    base=float(settings.openai_backoff_base_seconds),
+                    cap=float(settings.openai_backoff_max_seconds),
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if 500 <= resp.status_code <= 599:
+                if attempt >= max_retries:
+                    logger.warning(
+                        f"OpenAI batch server error after retries (status={resp.status_code})"
+                    )
+                    return {}
+                delay = self._compute_backoff_delay(
+                    attempt=attempt,
+                    base=float(settings.openai_backoff_base_seconds),
+                    cap=float(settings.openai_backoff_max_seconds),
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            try:
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                logger.warning(
+                    f"OpenAI batch API HTTP error (status={resp.status_code}): "
+                    f"{exc.response.text[:300]}"
+                )
+                return {}
+            break
+
+        if resp is None:
+            return {}
+
+        # Parse batch response
+        try:
+            body = resp.json()
+            raw_text = body["choices"][0]["message"]["content"]
+            cleaned = re.sub(r"^```(?:json)?\s*", "", raw_text.strip())
+            cleaned = re.sub(r"```\s*$", "", cleaned.strip())
+            parsed = json.loads(cleaned)
+
+            # OpenAI with response_format json_object may wrap in {"results": [...]}
+            if isinstance(parsed, dict):
+                for key in ("results", "organizations", "data", "items"):
+                    if key in parsed and isinstance(parsed[key], list):
+                        parsed = parsed[key]
+                        break
+
+            if not isinstance(parsed, list):
+                logger.warning("OpenAI batch response is not a JSON array")
+                return {}
+
+            results: Dict[str, Optional[Dict[str, Any]]] = {}
+            for item in parsed:
+                try:
+                    item_id = int(item.get("id", -1))
+                    if 0 <= item_id < len(org_names):
+                        org_name = org_names[item_id]
+                        results[org_name] = {
+                            "legal_form": item.get("legal_form", "unknown"),
+                            "src": item.get("src", "none"),
+                        }
+                except (ValueError, TypeError, AttributeError):
+                    continue
+
+            logger.info(
+                f"OpenAI batch: parsed {len(results)}/{len(org_names)} results"
+            )
+            return results
+
+        except Exception as exc:
+            logger.warning(f"Failed to parse OpenAI batch response: {exc}")
+            return {}
+
+    def _batch_result_to_classification(
+        self, org_name: str, llm_result: Dict[str, Any], provider: str
+    ) -> ClassificationResult:
+        """Convert a single LLM batch result dict into a ClassificationResult."""
+        legal_form = llm_result.get("legal_form", "unknown")
+        src = llm_result.get("src", "none")
+
+        is_unknown = not legal_form or str(legal_form).strip().lower() == "unknown"
+        has_no_link = not src or str(src).strip().lower() == "none"
+
+        if is_unknown or has_no_link:
+            return ClassificationResult(
+                organisation_name=org_name,
+                legal_form=legal_form if not is_unknown else None,
+                confidence="unknown",
+                source=provider,
+                link_to_src=None,
+            )
+
+        return ClassificationResult(
+            organisation_name=org_name,
+            legal_form=legal_form,
+            confidence="medium",
+            source=provider,
+            link_to_src=src,
+        )
+
     async def classify_organisation_web(self, org_name: str) -> ClassificationResult:
         """Classify via web with strict cache + in-flight de-duplication."""
         # Strict cache check before any network call.
@@ -904,10 +1264,58 @@ class ClassificationPipeline:
         # Fall back to web search
         return await self.classify_organisation_web(org_name)
     
+    def _write_checkpoint_csv(
+        self,
+        output_path: Path,
+        all_org_names: List[str],
+        classified_results: Dict[str, ClassificationResult],
+        web_results: Dict[str, ClassificationResult],
+        unknowns: List[str],
+        batch_idx: int,
+        num_batches: int,
+    ) -> None:
+        """Write an intermediate checkpoint CSV with all results so far."""
+        try:
+            # Merge fast-pass results with web results collected so far
+            merged = dict(classified_results)
+            for org_name in unknowns:
+                if org_name in web_results:
+                    merged[org_name] = web_results[org_name]
+                elif org_name not in merged:
+                    merged[org_name] = classify_as_unknown(org_name)
+
+            # Build ordered results matching the original input order
+            ordered_results = [
+                merged.get(name, classify_as_unknown(name))
+                for name in all_org_names
+            ]
+
+            checkpoint_df = pd.DataFrame(
+                {
+                    "organisation_name": all_org_names,
+                    "legal_form": [r.legal_form for r in ordered_results],
+                    "confidence": [r.confidence for r in ordered_results],
+                    "source": [r.source for r in ordered_results],
+                    "link_to_src": [r.link_to_src for r in ordered_results],
+                }
+            )
+
+            checkpoint_df.to_csv(
+                output_path, index=False, encoding="utf-8-sig", sep=";"
+            )
+            logger.info(
+                f"Checkpoint CSV saved after batch {batch_idx}/{num_batches}: "
+                f"{output_path}"
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to write checkpoint CSV: {exc}")
+
     async def process_batch(
         self,
         org_names: List[str],
-        show_progress: bool = True
+        show_progress: bool = True,
+        output_path: Optional[Path] = None,
+        all_org_names: Optional[List[str]] = None,
     ) -> List[ClassificationResult]:
         """Process a batch of organisations using a two-pass approach.
         
@@ -939,7 +1347,7 @@ class ClassificationPipeline:
         
         logger.info(f"Fast pass: {len(classified_results)} classified, {len(unknowns)} unknowns")
         
-        # Pass 2: Web search for unknowns only (chunked + deduplicated)
+        # Pass 2: Batch web search for unknowns (batch_size orgs per API call)
         if unknowns and not self.offline:
             # Deduplicate: only query each unique name once
             unique_unknowns = list(dict.fromkeys(unknowns))
@@ -950,72 +1358,116 @@ class ClassificationPipeline:
                     f"({duplicates_saved} duplicate API calls avoided)"
                 )
 
-            total_unknowns = len(unique_unknowns)
-            chunk_size = 1500
-            chunks = [unique_unknowns[i:i + chunk_size] for i in range(0, total_unknowns, chunk_size)]
+            # Filter out any that are already cached (e.g. from a resumed run)
+            uncached_unknowns = []
+            web_results: Dict[str, ClassificationResult] = {}
+            for name in unique_unknowns:
+                cached = self.cache.get(name)
+                if cached:
+                    web_results[name] = cached
+                else:
+                    uncached_unknowns.append(name)
+
+            if web_results:
+                logger.info(
+                    f"Pass 2 cache pre-filter: {len(web_results)} already cached, "
+                    f"{len(uncached_unknowns)} need API calls"
+                )
+
+            total_to_process = len(uncached_unknowns)
+            batch_size = max(1, int(settings.web_batch_size))
+            batches = [
+                uncached_unknowns[i:i + batch_size]
+                for i in range(0, total_to_process, batch_size)
+            ]
+            num_batches = len(batches)
 
             logger.info(
-                f"Pass 2: Web search for {total_unknowns} unique unknowns "
-                f"in {len(chunks)} chunks (chunk_size={chunk_size})..."
+                f"Pass 2: Batch web search for {total_to_process} unknowns "
+                f"in {num_batches} batches (batch_size={batch_size})..."
             )
-            pbar = tqdm(total=total_unknowns, desc="Web classification") if show_progress else None
+            pbar = tqdm(total=total_to_process, desc="Web classification (batch)") if show_progress else None
 
-            web_results: Dict[str, ClassificationResult] = {}
             processed = 0
             quota_stop = False
 
-            for chunk_idx, chunk in enumerate(chunks, start=1):
+            for batch_idx, batch in enumerate(batches, start=1):
                 # Early stop: both providers exhausted
                 if self._gemini_quota_exhausted and self._openai_quota_exhausted:
                     quota_stop = True
                     logger.warning(
-                        f"Pass 2 early stop before chunk {chunk_idx}/{len(chunks)}: "
+                        f"Pass 2 early stop before batch {batch_idx}/{num_batches}: "
                         f"both Gemini and OpenAI quota exhausted "
-                        f"({processed}/{total_unknowns} processed)."
+                        f"({processed}/{total_to_process} processed)."
                     )
                     break
 
                 logger.info(
-                    f"Pass 2 chunk {chunk_idx}/{len(chunks)} start "
-                    f"(size={len(chunk)}, processed={processed}/{total_unknowns})"
+                    f"Pass 2 batch {batch_idx}/{num_batches} "
+                    f"(size={len(batch)}, processed={processed}/{total_to_process})"
                 )
 
-                chunk_classified = 0
-                for name in chunk:
-                    # Check cache first to avoid redundant API calls on resume
-                    cached = self.cache.get(name)
-                    if cached:
-                        web_results[name] = cached
-                        processed += 1
-                        chunk_classified += 1
-                        if pbar:
-                            pbar.update(1)
-                        continue
+                # Try Gemini batch first
+                gemini_results = await self._call_gemini_batch(batch)
 
-                    result = await self.classify_organisation_web(name)
-                    web_results[name] = result
-                    processed += 1
-                    chunk_classified += 1
-                    if pbar:
-                        pbar.update(1)
-
-                    # Check quota after each call
-                    if self._gemini_quota_exhausted and self._openai_quota_exhausted:
-                        quota_stop = True
-                        logger.warning(
-                            f"Pass 2 early stop in chunk {chunk_idx}/{len(chunks)} after "
-                            f"{chunk_classified}/{len(chunk)} in chunk "
-                            f"({processed}/{total_unknowns} total)."
+                # Collect orgs that Gemini resolved
+                gemini_resolved = set()
+                for name in batch:
+                    if name in gemini_results and gemini_results[name] is not None:
+                        result = self._batch_result_to_classification(
+                            name, gemini_results[name], "gemini"
                         )
-                        break
+                        web_results[name] = result
+                        self.cache.set(result)
+                        gemini_resolved.add(name)
+
+                # Fallback: orgs not resolved by Gemini → try OpenAI batch
+                gemini_failed = [n for n in batch if n not in gemini_resolved]
+                if gemini_failed and not self._openai_quota_exhausted:
+                    openai_results = await self._call_openai_batch(gemini_failed)
+                    for name in gemini_failed:
+                        if name in openai_results and openai_results[name] is not None:
+                            result = self._batch_result_to_classification(
+                                name, openai_results[name], "openai"
+                            )
+                            web_results[name] = result
+                            self.cache.set(result)
+
+                # Any remaining unresolved → mark as unknown
+                for name in batch:
+                    if name not in web_results:
+                        result = classify_as_unknown(name)
+                        web_results[name] = result
+                        self.cache.set(result)
+
+                processed += len(batch)
+                if pbar:
+                    pbar.update(len(batch))
 
                 logger.info(
-                    f"Pass 2 chunk {chunk_idx}/{len(chunks)} done "
-                    f"({chunk_classified}/{len(chunk)} classified; "
-                    f"cumulative {processed}/{total_unknowns})"
+                    f"Pass 2 batch {batch_idx}/{num_batches} done "
+                    f"(cumulative {processed}/{total_to_process})"
                 )
 
-                if quota_stop:
+                # Checkpoint: write intermediate CSV every 50 batches
+                if output_path and batch_idx % 50 == 0:
+                    self._write_checkpoint_csv(
+                        output_path=output_path,
+                        all_org_names=all_org_names or org_names,
+                        classified_results=classified_results,
+                        web_results=web_results,
+                        unknowns=unknowns,
+                        batch_idx=batch_idx,
+                        num_batches=num_batches,
+                    )
+
+                # Check quota after batch
+                if self._gemini_quota_exhausted and self._openai_quota_exhausted:
+                    quota_stop = True
+                    logger.warning(
+                        f"Pass 2 early stop after batch {batch_idx}/{num_batches}: "
+                        f"both quotas exhausted ({processed}/{total_to_process} processed)."
+                    )
                     break
 
             if pbar:
@@ -1029,7 +1481,7 @@ class ClassificationPipeline:
                 )
 
             if quota_stop:
-                remaining = total_unknowns - processed
+                remaining = total_to_process - processed
                 if remaining > 0:
                     logger.warning(
                         f"Pass 2 fallback: marked {remaining} remaining organisations "
@@ -1074,7 +1526,11 @@ class ClassificationPipeline:
         logger.info(f"Processing {len(org_names)} organisations")
         
         # Classify all organisations
-        results = await self.process_batch(org_names)
+        results = await self.process_batch(
+            org_names,
+            output_path=output_path,
+            all_org_names=org_names,
+        )
 
         # Build a clean output with exactly 5 columns:
         #   organisation_name | legal_form | confidence | source | link_to_src
