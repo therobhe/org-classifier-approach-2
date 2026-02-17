@@ -2,9 +2,9 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    INPUT: CSV with org names                     │
-│                  (organisation_name column)                      │
-└─────────────────────────────────┬───────────────────────────────┘
+│                    INPUT: CSV with org names                   │
+│                  (organisation_name column)                    │
+└─────────────────────────────────┬──────────────────────────────┘
                                   │
                                   ▼
                     ┌─────────────────────────┐
@@ -106,44 +106,48 @@
                     └───────────────────────────────┘
 ```
 
+---
+
 ## Stage Details
 
-### Stage 1: Name Extraction (name_extractor.py)
+### Stage 1: Name Extraction (`name_extractor.py`)
 
-- **Pattern matching** against 30+ German legal forms
-- **Longest-first** ordering (avoid false positives)
-- **Coverage:** 60-70%
-- **Speed:** Instant
-- **Confidence:** High
-- **Source:** "name"
+- Pattern matching against 30+ German legal forms
+- Longest-first ordering (avoid false positives)
+- Coverage: 60-70%
+- Speed: Instant
+- Confidence: High
+- Source: "name"
 
-### Stage 2: Web Search + Impressum (web_search.py + impressum.py)
+### Stage 2: Web Search + Impressum (`web_search.py` + `impressum.py`)
 
-- **Google search** for "Organisation Impressum"
-- **Fetch top 1-3 results** with httpx
-- **Parse HTML** with BeautifulSoup
-- **Extract legal forms** from text
-- **Coverage:** +15-25%
-- **Speed:** ~2 seconds per org
-- **Confidence:** High (in title/headings) or Medium (in body)
-- **Source:** Impressum URL
-- **Skipped when:** `--offline` flag set
+- Google search for "Organisation Impressum"
+- Fetch top 1-3 results with httpx
+- Parse HTML with BeautifulSoup
+- Extract legal forms from text
+- Coverage: +15-25%
+- Speed: ~2 seconds per org
+- Confidence: High (in title/headings) or Medium (in body)
+- Source: Impressum URL
+- Skipped when: `--offline` flag set
 
-### Stage 3: Heuristics (heuristic.py)
+### Stage 3: Heuristics (`heuristic.py`)
 
-- **Keyword matching** (verein→e.V., stiftung→Stiftung, etc.)
-- **Conservative rules** (low false positive rate)
-- **Coverage:** +5-10%
-- **Speed:** Instant
-- **Confidence:** Low
-- **Source:** "heuristic"
+- Keyword matching (verein→e.V., stiftung→Stiftung, etc.)
+- Conservative rules (low false positive rate)
+- Coverage: +5-10%
+- Speed: Instant
+- Confidence: Low
+- Source: "heuristic"
 
-### Stage 4: Unknown (heuristic.py)
+### Stage 4: Unknown (`heuristic.py`)
 
-- **Fallback** for unclassifiable cases
-- **legal_form:** null
-- **confidence:** "unknown"
-- **source:** null
+- Fallback for unclassifiable cases
+- legal_form: null
+- confidence: "unknown"
+- source: null
+
+---
 
 ## Concurrency Control
 
@@ -159,6 +163,8 @@
 │  ▲ Additional requests wait                  │
 └──────────────────────────────────────────────┘
 ```
+
+---
 
 ## Caching Strategy
 
@@ -179,6 +185,8 @@
 └────────────────────────────────┘
 ```
 
+---
+
 ## Error Handling
 
 ```
@@ -187,13 +195,13 @@
 │                                      │
 │  Web Search:                         │
 │    • 3 attempts                      │
-│    • Exponential backoff: 2-10s     │
+│    • Exponential backoff: 2-10s      │
 │                                      │
 │  HTTP Fetch:                         │
 │    • 2 attempts                      │
-│    • Exponential backoff: 2-5s      │
+│    • Exponential backoff: 2-5s       │
 │                                      │
-│  On failure: Fall through to next   │
-│  stage (graceful degradation)       │
+│  On failure: Fall through to next    │
+│  stage (graceful degradation)        │
 └──────────────────────────────────────┘
 ```

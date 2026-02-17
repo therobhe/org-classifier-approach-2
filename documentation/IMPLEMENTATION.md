@@ -2,54 +2,57 @@
 
 ## Architecture Overview
 
-The pipeline implements a **confidence-based cascade** with four stages:
+The pipeline implements a **confidence-based cascade** with four main stages:
 
-1. **Name Extraction (Regex)** - ~60-70% hit rate, instant
-2. **Web Search + Impressum** - Medium coverage, slower (optional with `--offline`)
-3. **Heuristics** - Low-confidence fallback
-4. **Null Assignment** - Unknown cases
+1. **Name Extraction (Regex)** – Fast, high-confidence, ~60-70% hit rate
+2. **Web Search + Impressum** – Medium coverage, slower (optional, skipped with `--offline`)
+3. **Heuristics** – Low-confidence fallback
+4. **Null Assignment** – Unknown cases
+
+All stages are orchestrated asynchronously for high throughput and robust error handling.
+
+---
 
 ## Key Design Decisions
 
-### 1. Legal Form Patterns (constants.py)
+### 1. Legal Form Patterns (`constants.py`)
 
-- **30+ German legal forms** ordered longest-match-first to avoid false positives
-- Example: `GmbH & Co. KG` must match before plain `GmbH`
-- Regex patterns use word boundaries (`\b`) to prevent substring matches
-- Case-insensitive matching for robustness
+- 30+ German legal forms, ordered longest-match-first to avoid false positives
+- Regex patterns use word boundaries (`\b`) and are case-insensitive
+- Easy to extend with new forms
 
 ### 2. Async Architecture
 
-- Uses `asyncio` + `httpx.AsyncClient` for concurrent web requests
+- Uses `asyncio` and `httpx.AsyncClient` for concurrent web requests
 - `asyncio.Semaphore` limits concurrent requests (default: 5)
-- Prevents rate-limiting and resource exhaustion
-- All I/O operations (web, disk cache) are async
+- All I/O operations (web, disk cache) are async for maximum throughput
 
-### 3. Caching Strategy (cache.py)
+### 3. Caching Strategy (`cache.py`)
 
-- **Disk-based cache** using `diskcache` (survives restarts)
+- Disk-based cache using `diskcache` (survives restarts)
 - Keys are normalized: `org:<lowercase_trimmed_name>`
-- Avoids redundant web searches across multiple runs
+- Avoids redundant web searches across runs
 - Can be cleared with `--clear-cache` flag
 
 ### 4. Error Handling
 
-- **Tenacity** library for automatic retries (exponential backoff)
-- Web search: 3 attempts, 2-10 second backoff
-- Page fetch: 2 attempts, 2-5 second backoff
+- Tenacity library for automatic retries (exponential backoff)
+- Web search: 3 attempts, 2-10s backoff
+- Page fetch: 2 attempts, 2-5s backoff
 - Failures gracefully fall through to next stage
 
 ### 5. Offline Mode
 
 - `--offline` flag skips web search stage entirely
 - Cascade becomes: Name → Heuristics → Unknown
-- Useful for: testing, air-gapped environments, fast dry-runs
-- ~60-75% coverage without web access
+- Useful for testing, air-gapped environments, and fast dry-runs
 
 ### 6. Progress Tracking
 
 - Uses `tqdm` for progress bar during batch processing
 - Logs statistics after completion (confidence/source breakdown)
+
+---
 
 ## Pipeline Flow Example
 
@@ -70,6 +73,8 @@ Input: "Berliner Verein für Kultur"
   └─ Result: e.V., low, heuristic
 ```
 
+---
+
 ## Performance Characteristics
 
 | Stage           | Coverage  | Speed   | Confidence  |
@@ -84,75 +89,27 @@ Input: "Berliner Verein für Kultur"
 - Offline mode: 10,000+ orgs/second
 - Online mode: ~150-300 orgs/minute (rate-limited)
 
-## Further Considerations (From Plan)
+---
+
+## Extensibility & Future Enhancements
 
 ### 1. Web Search API Choice
 
-**Current:** `googlesearch-python` (free, fragile, rate-limited)
-
-**Alternatives:**
-
-- **SerpAPI** ($50/mo, 5000 searches) - Reliable, no rate limits
-- **Searx** (self-hosted) - Free, requires infrastructure
-- **Bing Search API** ($7/1000 queries) - Microsoft alternative
-
-**Recommendation:** For production with >10k orgs, use SerpAPI or Bing API.
+- **Current:** `googlesearch-python` (free, fragile, rate-limited)
+- **Alternatives:** SerpAPI, Searx, Bing Search API (recommended for production)
 
 ### 2. LLM Fallback Stage
 
-**Proposal:** Add GPT-4o / local-LLM between heuristics and null-assignment
-
-**Pros:**
-
-- Boosts recall on ambiguous cases (e.g., "Berliner Kulturgesellschaft")
-- Can handle typos, abbreviations, foreign names
-
-**Cons:**
-
-- Adds 1-2s latency per org
-- Costs $0.01-0.05 per org (GPT-4)
-- Requires API key / local model setup
-
-**Implementation:**
-
-```python
-# src/org_classifier/classifiers/llm.py
-async def classify_by_llm(org_name: str) -> ClassificationResult:
-    prompt = f"Extract German legal form from: {org_name}"
-    # Call OpenAI / local LLM
-    # Return high/medium confidence result
-```
-
-**Recommendation:** Add as **optional stage** behind `--use-llm` flag.
+- Optional: Add GPT-4o/local-LLM between heuristics and null-assignment
+- Would boost recall on ambiguous cases
+- Not implemented by default (see docs for example implementation)
 
 ### 3. Handelsregister Lookup
 
-**API:** `offeneregister.de` (free, authoritative data)
+- Optional: Integrate offeneregister.de API as authoritative source
+- Add as Stage 1.5 (after name, before web search)
 
-**Integration point:** Between name extraction and web search
-
-**Pros:**
-
-- Authoritative legal-form data
-- High confidence results
-- No scraping ambiguity
-
-**Cons:**
-
-- Not all organisations in Handelsregister (e.g., small Vereine)
-- API rate limits unknown
-- Requires exact name matching
-
-**Implementation:**
-
-```python
-# src/org_classifier/classifiers/handelsregister.py
-async def classify_by_handelsregister(org_name: str) -> ClassificationResult:
-    # Query offeneregister.de API
-    # Return high confidence if found
-```
-
-**Recommendation:** Add as **Stage 1.5** (after name, before web search).
+---
 
 ## Installation & Usage
 
@@ -181,6 +138,8 @@ org-classifier input.csv output.csv --max-workers 10 --cache-dir .mycache
 python test_pipeline.py
 ```
 
+---
+
 ## CSV Format
 
 **Input:**
@@ -201,22 +160,26 @@ Deutsche Bank AG,AG,high,name
 FC Bayern München e.V.,e.V.,high,name
 ```
 
+---
+
 ## Dependencies
 
-- **pandas** - CSV I/O
-- **httpx** - Async HTTP client
-- **beautifulsoup4 + lxml** - HTML parsing
-- **googlesearch-python** - Web search (fragile!)
-- **diskcache** - Persistent caching
-- **tenacity** - Retry logic
-- **pydantic** - Data validation
-- **typer** - CLI framework
-- **tqdm** - Progress bars
+- pandas – CSV I/O
+- httpx – Async HTTP client
+- beautifulsoup4 + lxml – HTML parsing
+- googlesearch-python – Web search
+- diskcache – Persistent caching
+- tenacity – Retry logic
+- pydantic – Data validation
+- typer – CLI framework
+- tqdm – Progress bars
+
+---
 
 ## Next Steps
 
-1. **Test with real data** - Run on sample dataset, measure accuracy
-2. **Add Handelsregister stage** - Integrate offeneregister.de API
-3. **Improve heuristics** - Add more conservative keyword rules
-4. **Consider LLM fallback** - For production use with high accuracy requirements
-5. **Switch to paid search API** - If processing >10k organisations
+1. **Test with real data** – Run on sample dataset, measure accuracy
+2. **Add Handelsregister stage** – Integrate offeneregister.de API
+3. **Improve heuristics** – Add more conservative keyword rules
+4. **Consider LLM fallback** – For production use with high accuracy requirements
+5. **Switch to paid search API** – If processing >10k organisations
