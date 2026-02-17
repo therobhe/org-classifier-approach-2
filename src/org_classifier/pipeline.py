@@ -21,7 +21,7 @@ from .utils import normalize_org_name
 from .config import settings
 
 # External API endpoints (can be overridden in future by config)
-GEMINI_API_URL = "https://api.generativeai.googleapis.com/v1/models/{model}:generate"
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
 GEMINI_PROMPT_TEMPLATE = (
@@ -170,6 +170,8 @@ class ClassificationPipeline:
         self._openai_requests_today = 0
         self._openai_tokens_today = 0
         self._openai_limits_logged = False
+        self._inflight_web_lock = asyncio.Lock()
+        self._inflight_web_requests: Dict[str, asyncio.Task] = {}
     
     async def __aenter__(self):
         """Async context manager entry."""
@@ -262,7 +264,6 @@ class ClassificationPipeline:
             thinking_budget = thinking_budget_map.get(thinking_level, 0)
 
             payload["generationConfig"] = {
-                "mediaResolution": media_resolution,
                 "thinkingConfig": {"thinkingBudget": thinking_budget},
             }
         except Exception:
@@ -271,31 +272,33 @@ class ClassificationPipeline:
         # Optionally enable Google Search grounding for Gemini.
         try:
             if bool(settings.gemini_use_google_search_grounding):
-                payload["tools"] = [{"google_search": {"media_resolution": "low"}}]
+                payload["tools"] = [{"google_search": {}}]
         except Exception:
             # Proceed without grounding if config parsing fails.
             pass
         # Optionally request structured JSON output from Gemini
         try:
-            if bool(settings.gemini_use_structured_output):
+            # Note: Gemini REST API currently does not support response_format/structured output
+            # simultaneously with tool use (grounding). If grounding is enabled, we skip structured output.
+            use_grounding = bool(settings.gemini_use_google_search_grounding)
+            if bool(settings.gemini_use_structured_output) and not use_grounding:
                 # Default schema: legal_form and src string fields
                 if settings.gemini_structured_output_schema:
                     schema = json.loads(settings.gemini_structured_output_schema)
                 else:
                     schema = {
-                        "title": "OrgLegalForm",
-                        "type": "object",
+                        "type": "OBJECT",
                         "properties": {
-                            "legal_form": {"type": ["string", "null"]},
-                            "src": {"type": ["string", "null"]},
+                            "legal_form": {"type": "STRING"},
+                            "src": {"type": "STRING"},
                         },
-                        "required": [],
+                        "required": ["legal_form", "src"],
                     }
 
-                payload["response_format"] = {
-                    "type": "json_schema",
-                    "json_schema": schema,
-                }
+                if "generationConfig" not in payload:
+                    payload["generationConfig"] = {}
+                payload["generationConfig"]["responseMimeType"] = "application/json"
+                payload["generationConfig"]["responseSchema"] = schema
         except Exception:
             # Proceed without structured output if schema parsing fails
             pass
@@ -797,6 +800,31 @@ class ClassificationPipeline:
             return False
 
     async def classify_organisation_web(self, org_name: str) -> ClassificationResult:
+        """Classify via web with strict cache + in-flight de-duplication."""
+        # Strict cache check before any network call.
+        cached = self.cache.get(org_name)
+        if cached:
+            return cached
+
+        request_key = org_name.strip().lower()
+        created_task = False
+
+        async with self._inflight_web_lock:
+            task = self._inflight_web_requests.get(request_key)
+            if task is None:
+                task = asyncio.create_task(self._classify_organisation_web_uncached(org_name))
+                self._inflight_web_requests[request_key] = task
+                created_task = True
+
+        try:
+            return await task
+        finally:
+            if created_task:
+                async with self._inflight_web_lock:
+                    if self._inflight_web_requests.get(request_key) is task:
+                        self._inflight_web_requests.pop(request_key, None)
+
+    async def _classify_organisation_web_uncached(self, org_name: str) -> ClassificationResult:
         """
         Expensive classification using Gemini API.
         Only called for organisations that couldn't be classified by fast methods.
@@ -846,34 +874,17 @@ class ClassificationPipeline:
                     self.cache.set(result)
                     return result
 
-                # Part 2, Case 2: legal_form + src URL present → verify
-                # Part 3: Verify the returned URL
-                url_valid = await self._verify_url(src)
-
-                if url_valid:
-                    result = ClassificationResult(
-                        organisation_name=org_name,
-                        legal_form=legal_form,
-                        confidence="medium",
-                        source=llm_provider,
-                        link_to_src=src,
-                    )
-                    self.cache.set(result)
-                    return result
-                else:
-                    logger.info(
-                        f"URL verification failed for '{org_name}' "
-                        f"(url={src}) – marking as unknown"
-                    )
-                    result = ClassificationResult(
-                        organisation_name=org_name,
-                        legal_form=None,
-                        confidence="unknown",
-                        source=None,
-                        link_to_src=None,
-                    )
-                    self.cache.set(result)
-                    return result
+                # Part 2, Case 2: legal_form + src URL present → accept result
+                # Part 3: Return result directly without HTTP verification
+                result = ClassificationResult(
+                    organisation_name=org_name,
+                    legal_form=legal_form,
+                    confidence="medium",
+                    source=llm_provider,
+                    link_to_src=src,
+                )
+                self.cache.set(result)
+                return result
 
         # Stage 3: Fallback to unknown
         result = classify_as_unknown(org_name)
@@ -940,8 +951,7 @@ class ClassificationPipeline:
                 )
 
             total_unknowns = len(unique_unknowns)
-            target_chunks = 25
-            chunk_size = max(1, (total_unknowns + target_chunks - 1) // target_chunks)
+            chunk_size = 1500
             chunks = [unique_unknowns[i:i + chunk_size] for i in range(0, total_unknowns, chunk_size)]
 
             logger.info(

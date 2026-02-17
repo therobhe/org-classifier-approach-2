@@ -18,6 +18,8 @@ Perfect for testing or when you only need regex-based classification.
 
 ```bash
 org-classifier input.csv output.csv --offline
+
+./.venv/bin/python -m org_classifier.main ./data/input_src.csv ./data/enriched_output.csv 
 ```
 
 Coverage: ~60-70% (high confidence)
