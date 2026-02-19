@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     cache_dir: str = ".cache"
     max_concurrent_requests: int = 5
     gemini_api_key: Optional[str] = None
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash-lite"
     gemini_timeout_seconds: float = 30.0
     gemini_max_retries: int = 4
     gemini_backoff_base_seconds: float = 1.5

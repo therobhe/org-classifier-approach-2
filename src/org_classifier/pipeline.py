@@ -802,12 +802,14 @@ class ClassificationPipeline:
         return min(resolved_cap, delay + jitter)
 
     async def _verify_url(self, url: str) -> bool:
-        """Verify a URL is reachable via HTTP HEAD (returns True for 2xx)."""
+        """Verify a URL is reachable via HTTP GET and returns 200 OK."""
         try:
-            resp = await self.http_client.head(url, follow_redirects=True, timeout=10.0)
-            return resp.is_success
+            # We use GET because many servers and CDNs (Cloudflare, etc.) block HEAD requests
+            resp = await self.http_client.get(url, follow_redirects=True, timeout=10.0)
+            return resp.status_code == 200
         except Exception:
             return False
+
 
     async def _call_gemini_batch(self, org_names: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
         """Call Gemini API with a batch of org names and return a dict mapping org_name -> parsed result."""
@@ -1200,7 +1202,7 @@ class ClassificationPipeline:
         """
         if not self.offline:
             # Part 1: Send query to Gemini, then fallback to OpenAI if needed
-            llm_provider = "gemini"
+            llm_provider = "web_search"
             llm_result = await self._call_gemini(org_name)
 
             if llm_result is None:
@@ -1234,15 +1236,27 @@ class ClassificationPipeline:
                     self.cache.set(result)
                     return result
 
-                # Part 2, Case 2: legal_form + src URL present → accept result
-                # Part 3: Return result directly without HTTP verification
-                result = ClassificationResult(
-                    organisation_name=org_name,
-                    legal_form=legal_form,
-                    confidence="medium",
-                    source=llm_provider,
-                    link_to_src=src,
-                )
+                # Part 2, Case 2: legal_form + src URL present → verify URL
+                is_valid = await self._verify_url(src)
+
+                # Part 3: Return result with validated URL
+                if is_valid:
+                    result = ClassificationResult(
+                        organisation_name=org_name,
+                        legal_form=legal_form,
+                        confidence="medium",
+                        source=llm_provider,
+                        link_to_src=src,
+                    )
+                else:
+                    logger.info(f"URL validation failed for '{org_name}' (URL: {src}). Falling back to unknown.")
+                    result = ClassificationResult(
+                        organisation_name=org_name,
+                        legal_form=None,
+                        confidence="unknown",
+                        source=llm_provider,
+                        link_to_src=None,
+                    )
                 self.cache.set(result)
                 return result
 
@@ -1410,12 +1424,40 @@ class ClassificationPipeline:
                 # Try Gemini batch first
                 gemini_results = await self._call_gemini_batch(batch)
 
-                # Collect orgs that Gemini resolved
+                # Collect orgs that Gemini resolved and validate URLs concurrently
                 gemini_resolved = set()
+                
+                # Prepare tasks to validate URLs
+                validation_tasks = {}
                 for name in batch:
                     if name in gemini_results and gemini_results[name] is not None:
+                        src = gemini_results[name].get("src")
+                        if src and src.lower() != "none" and src.lower() != "unknown":
+                            validation_tasks[name] = asyncio.create_task(self._verify_url(src))
+                
+                if validation_tasks:
+                    await asyncio.gather(*validation_tasks.values(), return_exceptions=True)
+
+                for name in batch:
+                    if name in gemini_results and gemini_results[name] is not None:
+                        is_valid = True
+                        src = gemini_results[name].get("src")
+                        
+                        if name in validation_tasks:
+                            try:
+                                is_valid = validation_tasks[name].result()
+                                if not is_valid:
+                                    logger.info(f"Gemini URL validation failed for '{name}' (URL: {src}). Falling back to unknown.")
+                                    gemini_results[name]["legal_form"] = "unknown"
+                                    gemini_results[name]["src"] = "none"
+                            except Exception:
+                                is_valid = False
+                                logger.info(f"Gemini URL validation raised exception for '{name}'. Falling back.")
+                                gemini_results[name]["legal_form"] = "unknown"
+                                gemini_results[name]["src"] = "none"
+
                         result = self._batch_result_to_classification(
-                            name, gemini_results[name], "gemini"
+                            name, gemini_results[name], "web_search"
                         )
                         web_results[name] = result
                         self.cache.set(result)
@@ -1425,8 +1467,36 @@ class ClassificationPipeline:
                 gemini_failed = [n for n in batch if n not in gemini_resolved]
                 if gemini_failed and not self._openai_quota_exhausted:
                     openai_results = await self._call_openai_batch(gemini_failed)
+                    
+                    # Prepare tasks to validate URLs for OpenAI
+                    openai_validation_tasks = {}
                     for name in gemini_failed:
                         if name in openai_results and openai_results[name] is not None:
+                            src = openai_results[name].get("src")
+                            if src and src.lower() != "none" and src.lower() != "unknown":
+                                openai_validation_tasks[name] = asyncio.create_task(self._verify_url(src))
+                    
+                    if openai_validation_tasks:
+                        await asyncio.gather(*openai_validation_tasks.values(), return_exceptions=True)
+
+                    for name in gemini_failed:
+                        if name in openai_results and openai_results[name] is not None:
+                            is_valid = True
+                            src = openai_results[name].get("src")
+                            
+                            if name in openai_validation_tasks:
+                                try:
+                                    is_valid = openai_validation_tasks[name].result()
+                                    if not is_valid:
+                                        logger.info(f"OpenAI URL validation failed for '{name}' (URL: {src}). Falling back to unknown.")
+                                        openai_results[name]["legal_form"] = "unknown"
+                                        openai_results[name]["src"] = "none"
+                                except Exception:
+                                    is_valid = False
+                                    logger.info(f"OpenAI URL validation raised exception for '{name}'. Falling back.")
+                                    openai_results[name]["legal_form"] = "unknown"
+                                    openai_results[name]["src"] = "none"
+
                             result = self._batch_result_to_classification(
                                 name, openai_results[name], "openai"
                             )
