@@ -7,7 +7,7 @@
 pip install -e .
 
 # Verify installation
-org-classifier version
+org-classifier --version
 ```
 
 ## Basic Usage
@@ -17,10 +17,12 @@ org-classifier version
 Perfect for testing or when you only need regex-based classification.
 
 ```bash
-org-classifier sample_input.csv output.csv --offline
+org-classifier input.csv output.csv --offline
+
+./.venv/bin/python -m org_classifier.main ./data/input_src.csv ./data/enriched_output.csv 
 ```
 
-Coverage: ~60-70% (high confidence)  
+Coverage: ~60-70% (high confidence)
 Speed: 10,000+ organisations/second
 
 ### 2. Online Mode (Full Pipeline)
@@ -28,10 +30,10 @@ Speed: 10,000+ organisations/second
 Uses web search + Impressum scraping for better coverage.
 
 ```bash
-org-classifier sample_input.csv output.csv
+org-classifier input.csv output.csv
 ```
 
-Coverage: ~85-90% (high + medium confidence)  
+Coverage: ~85-90% (high + medium confidence)
 Speed: ~150-300 organisations/minute (rate-limited)
 
 ### 3. Custom Configuration
@@ -41,7 +43,7 @@ Speed: ~150-300 organisations/minute (rate-limited)
 org-classifier input.csv output.csv --max-workers 10
 
 # Custom cache directory
-org-classifier input.csv output.csv --cache-dir /path/to/cache
+org-classifier input.csv output.csv --cache-dir .mycache
 
 # Custom column name
 org-classifier input.csv output.csv --column company_name
@@ -96,17 +98,17 @@ Stiftung Warentest,Stiftung,high,name
 
 ## Confidence Levels
 
-- **high** - Extracted from name or found in Impressum heading/title
-- **medium** - Found in Impressum body text
-- **low** - Heuristic keyword match
-- **unknown** - No classification possible
+- **high** – Extracted from name or found in Impressum heading/title
+- **medium** – Found in Impressum body text
+- **low** – Heuristic keyword match
+- **unknown** – No classification possible
 
 ## Source Types
 
-- **name** - Extracted directly from organisation name
-- **<URL>** - Found in Impressum at this URL
-- **heuristic** - Conservative keyword matching
-- **null** - No classification found
+- **name** – Extracted directly from organisation name
+- **<URL>** – Found in Impressum at this URL
+- **heuristic** – Conservative keyword matching
+- **null** – No classification found
 
 ## Common Use Cases
 
@@ -135,10 +137,10 @@ org-classifier input.csv output.csv --clear-cache
 
 ## Performance Tips
 
-1. **Start with offline mode** - Gets 60-70% instantly
-2. **Lower max-workers for web search** - Avoids rate limits (use 3-5)
-3. **Use cache** - Don't clear it unless necessary
-4. **Split large files** - Process in batches of 10-50k
+1. **Start with offline mode** – Gets 60-70% instantly
+2. **Lower max-workers for web search** – Avoids rate limits (use 3-5)
+3. **Use cache** – Don't clear it unless necessary
+4. **Split large files** – Process in batches of 10-50k
 
 ## Troubleshooting
 

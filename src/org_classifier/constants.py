@@ -97,5 +97,8 @@ HEURISTIC_KEYWORDS: Dict[str, str] = {
     "schützenverein": "e.V.",
     "Wohlfahrtsverband": "e.V.",
     "Gesamtverband": "e.V.",
+    "Verein": "e.V.",
+    "Verband": "e.V.",
     "genossenschaft": "eG",
+
 }
