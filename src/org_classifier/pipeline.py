@@ -4,6 +4,7 @@ import random
 import re
 from collections import deque
 from datetime import date
+from urllib.parse import quote_plus
 import httpx
 import pandas as pd
 from pathlib import Path
@@ -17,7 +18,7 @@ from .models import ClassificationResult
 from .classifiers.name_extractor import classify_by_name
 from .classifiers.heuristic import classify_by_heuristic, classify_as_unknown
 from .party_rules import classify_party
-from .utils import normalize_org_name
+from .utils import normalize_org_name, sanitize_legal_form
 from .config import settings
 
 # External API endpoints (can be overridden in future by config)
@@ -801,14 +802,23 @@ class ClassificationPipeline:
         jitter = random.uniform(0.0, delay * 0.25)
         return min(resolved_cap, delay + jitter)
 
-    async def _verify_url(self, url: str) -> bool:
-        """Verify a URL is reachable via HTTP GET and returns 200 OK."""
+    @staticmethod
+    def _google_search_url(org_name: str) -> str:
+        """Build a Google search URL for the given organisation name + Rechtsform."""
+        query = f"{org_name} Rechtsform"
+        return f"https://www.google.com/search?q={quote_plus(query)}"
+
+    async def _verify_url(self, url: str) -> Tuple[bool, Optional[str], bool]:
+        """Verify URL reachability and return (is_valid, resolved_url, had_301_redirect)."""
         try:
             # We use GET because many servers and CDNs (Cloudflare, etc.) block HEAD requests
             resp = await self.http_client.get(url, follow_redirects=True, timeout=10.0)
-            return resp.status_code == 200
+            had_301 = any(r.status_code == 301 for r in resp.history)
+            is_valid = resp.status_code == 200
+            resolved_url = str(resp.url) if resp.url is not None else None
+            return is_valid, resolved_url, had_301
         except Exception:
-            return False
+            return False, None, False
 
 
     async def _call_gemini_batch(self, org_names: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
@@ -1138,8 +1148,9 @@ class ClassificationPipeline:
         self, org_name: str, llm_result: Dict[str, Any], provider: str
     ) -> ClassificationResult:
         """Convert a single LLM batch result dict into a ClassificationResult."""
-        legal_form = llm_result.get("legal_form", "unknown")
+        legal_form = sanitize_legal_form(llm_result.get("legal_form", "unknown"))
         src = llm_result.get("src", "none")
+        verification_failed = bool(llm_result.get("_verification_failed"))
 
         is_unknown = not legal_form or str(legal_form).strip().lower() == "unknown"
         has_no_link = not src or str(src).strip().lower() == "none"
@@ -1156,7 +1167,7 @@ class ClassificationPipeline:
         return ClassificationResult(
             organisation_name=org_name,
             legal_form=legal_form,
-            confidence="medium",
+            confidence="low" if verification_failed else "medium",
             source=provider,
             link_to_src=src,
         )
@@ -1212,7 +1223,7 @@ class ClassificationPipeline:
                     llm_result = fallback_result
 
             if llm_result is not None:
-                legal_form = llm_result.get("legal_form", "unknown")
+                legal_form = sanitize_legal_form(llm_result.get("legal_form", "unknown"))
                 src = llm_result.get("src", "none")
 
                 # Part 2, Case 1: Gemini returned unknown / no link
@@ -1237,25 +1248,36 @@ class ClassificationPipeline:
                     return result
 
                 # Part 2, Case 2: legal_form + src URL present → verify URL
-                is_valid = await self._verify_url(src)
+                is_valid, resolved_url, had_301 = await self._verify_url(src)
 
                 # Part 3: Return result with validated URL
                 if is_valid:
+                    validated_src = resolved_url or src
+                    if had_301 and validated_src != src:
+                        logger.info(
+                            f"URL redirect (301) for '{org_name}': '{src}' -> '{validated_src}'"
+                        )
+                    # Green highlight for successful validation
+                    print(f"\033[92m✔ URL verified for '{org_name}': {validated_src}\033[0m")
                     result = ClassificationResult(
                         organisation_name=org_name,
                         legal_form=legal_form,
                         confidence="medium",
                         source=llm_provider,
-                        link_to_src=src,
+                        link_to_src=validated_src,
                     )
                 else:
-                    logger.info(f"URL validation failed for '{org_name}' (URL: {src}). Falling back to unknown.")
+                    google_url = self._google_search_url(org_name)
+                    logger.info(
+                        f"URL validation failed for '{org_name}' (URL: {src}). "
+                        f"Falling back to Google search: {google_url}"
+                    )
                     result = ClassificationResult(
                         organisation_name=org_name,
-                        legal_form=None,
-                        confidence="unknown",
+                        legal_form=legal_form,
+                        confidence="low",
                         source=llm_provider,
-                        link_to_src=None,
+                        link_to_src=google_url,
                     )
                 self.cache.set(result)
                 return result
@@ -1445,16 +1467,30 @@ class ClassificationPipeline:
                         
                         if name in validation_tasks:
                             try:
-                                is_valid = validation_tasks[name].result()
-                                if not is_valid:
-                                    logger.info(f"Gemini URL validation failed for '{name}' (URL: {src}). Falling back to unknown.")
-                                    gemini_results[name]["legal_form"] = "unknown"
-                                    gemini_results[name]["src"] = "none"
+                                is_valid, resolved_url, had_301 = validation_tasks[name].result()
+                                if is_valid:
+                                    validated_src = resolved_url or src
+                                    if had_301 and validated_src != src:
+                                        logger.info(
+                                            f"Gemini URL redirect (301) for '{name}': "
+                                            f"'{src}' -> '{validated_src}'"
+                                        )
+                                    gemini_results[name]["src"] = validated_src
+                                    print(f"\033[92m✔ URL verified for '{name}': {validated_src}\033[0m")
+                                else:
+                                    google_url = self._google_search_url(name)
+                                    logger.info(
+                                        f"Gemini URL validation failed for '{name}' (URL: {src}). "
+                                        f"Falling back to Google search: {google_url}"
+                                    )
+                                    gemini_results[name]["src"] = google_url
+                                    gemini_results[name]["_verification_failed"] = True
                             except Exception:
                                 is_valid = False
-                                logger.info(f"Gemini URL validation raised exception for '{name}'. Falling back.")
-                                gemini_results[name]["legal_form"] = "unknown"
-                                gemini_results[name]["src"] = "none"
+                                google_url = self._google_search_url(name)
+                                logger.info(f"Gemini URL validation raised exception for '{name}'. Falling back to Google search.")
+                                gemini_results[name]["src"] = google_url
+                                gemini_results[name]["_verification_failed"] = True
 
                         result = self._batch_result_to_classification(
                             name, gemini_results[name], "web_search"
@@ -1486,16 +1522,30 @@ class ClassificationPipeline:
                             
                             if name in openai_validation_tasks:
                                 try:
-                                    is_valid = openai_validation_tasks[name].result()
-                                    if not is_valid:
-                                        logger.info(f"OpenAI URL validation failed for '{name}' (URL: {src}). Falling back to unknown.")
-                                        openai_results[name]["legal_form"] = "unknown"
-                                        openai_results[name]["src"] = "none"
+                                    is_valid, resolved_url, had_301 = openai_validation_tasks[name].result()
+                                    if is_valid:
+                                        validated_src = resolved_url or src
+                                        if had_301 and validated_src != src:
+                                            logger.info(
+                                                f"OpenAI URL redirect (301) for '{name}': "
+                                                f"'{src}' -> '{validated_src}'"
+                                            )
+                                        openai_results[name]["src"] = validated_src
+                                        print(f"\033[92m✔ URL verified for '{name}': {validated_src}\033[0m")
+                                    else:
+                                        google_url = self._google_search_url(name)
+                                        logger.info(
+                                            f"OpenAI URL validation failed for '{name}' (URL: {src}). "
+                                            f"Falling back to Google search: {google_url}"
+                                        )
+                                        openai_results[name]["src"] = google_url
+                                        openai_results[name]["_verification_failed"] = True
                                 except Exception:
                                     is_valid = False
-                                    logger.info(f"OpenAI URL validation raised exception for '{name}'. Falling back.")
-                                    openai_results[name]["legal_form"] = "unknown"
-                                    openai_results[name]["src"] = "none"
+                                    google_url = self._google_search_url(name)
+                                    logger.info(f"OpenAI URL validation raised exception for '{name}'. Falling back to Google search.")
+                                    openai_results[name]["src"] = google_url
+                                    openai_results[name]["_verification_failed"] = True
 
                             result = self._batch_result_to_classification(
                                 name, openai_results[name], "openai"

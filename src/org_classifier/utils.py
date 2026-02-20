@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from typing import Optional
+
+from .constants import LEGAL_FORMS
 
 
 _QUOTE_CHARS = "\"'“”„‚‘’"
@@ -35,3 +38,34 @@ def normalize_org_name(value: object) -> str:
     text = text.strip(";\t\r\n")
 
     return text
+
+
+def sanitize_legal_form(raw_legal_form: Optional[str]) -> Optional[str]:
+    """Normalize a raw legal-form string (typically from an LLM) to its
+    canonical abbreviation using the same LEGAL_FORMS regex patterns that
+    drive the name-extraction classifier.
+
+    Examples:
+        "eingetragener Verein e.V."  -> "e.V."
+        "eingetragener Verein"       -> "e.V."
+        "Aktiengesellschaft"         -> "AG"
+        "gemeinnützige GmbH"         -> "gGmbH"
+        "Gesellschaft mit beschränkter Haftung" -> "GmbH"
+        "unknown"                    -> "unknown"  (passthrough)
+        None                         -> None       (passthrough)
+    """
+    if raw_legal_form is None:
+        return None
+
+    stripped = str(raw_legal_form).strip()
+    if not stripped or stripped.lower() == "unknown":
+        return stripped or None
+
+    # Run through the same ordered regex patterns used for name extraction.
+    # First match wins (longest / most-specific patterns come first).
+    for canonical, pattern in LEGAL_FORMS:
+        if pattern.search(stripped):
+            return canonical
+
+    # No pattern matched – return the original string unchanged.
+    return stripped
