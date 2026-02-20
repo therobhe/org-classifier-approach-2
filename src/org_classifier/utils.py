@@ -4,7 +4,7 @@ import re
 import unicodedata
 from typing import Optional
 
-from .constants import LEGAL_FORMS
+from .constants import HEURISTIC_KEYWORDS, LEGAL_FORMS
 
 
 _QUOTE_CHARS = "\"'“”„‚‘’"
@@ -45,12 +45,19 @@ def sanitize_legal_form(raw_legal_form: Optional[str]) -> Optional[str]:
     canonical abbreviation using the same LEGAL_FORMS regex patterns that
     drive the name-extraction classifier.
 
+    Whitelist behavior: only canonical legal forms from local step-1 rules
+    are accepted. Unmatched/free-text values are treated as "unknown".
+
     Examples:
         "eingetragener Verein e.V."  -> "e.V."
         "eingetragener Verein"       -> "e.V."
         "Aktiengesellschaft"         -> "AG"
         "gemeinnützige GmbH"         -> "gGmbH"
         "Gesellschaft mit beschränkter Haftung" -> "GmbH"
+        "Trachtenkapelle"            -> "unknown"
+        "Imkerverein"                -> "e.V."      (heuristic fallback)
+        "Schützenverein"             -> "e.V."      (heuristic fallback)
+        "Verein"                     -> "e.V."      (heuristic fallback)
         "unknown"                    -> "unknown"  (passthrough)
         None                         -> None       (passthrough)
     """
@@ -67,5 +74,15 @@ def sanitize_legal_form(raw_legal_form: Optional[str]) -> Optional[str]:
         if pattern.search(stripped):
             return canonical
 
-    # No pattern matched – return the original string unchanged.
-    return stripped
+    # Fallback to heuristic keyword mapping used in step-1 local classification.
+    stripped_lower = stripped.lower()
+    for keyword, mapped_legal_form in HEURISTIC_KEYWORDS.items():
+        if str(keyword).lower() in stripped_lower:
+            return mapped_legal_form
+
+    # Accept party classification from local party rules used in fast pass.
+    if stripped.lower() == "partei":
+        return "Partei"
+
+    # No pattern matched – reject hallucinated/non-legal-form free text.
+    return "unknown"
