@@ -1764,3 +1764,76 @@ class ClassificationPipeline:
             "by_legal_form": by_legal_form,
             "forms_sorted": forms_sorted,
         }
+
+def remove_estimated_forms(input_path: Path, output_path: Path) -> None:
+    """
+    Standalone mode: reads a previously classified CSV, removes the legal_form 
+    if confidence is 'unknown', and writes out the updated CSV with correct statistics.
+    """
+    import io
+    
+    logger.info(f"Running standalone --no-estimated-form mode on {input_path}")
+    
+    lines = []
+    with input_path.open("r", encoding="utf-8-sig", errors="replace") as f:
+        for line in f:
+            if line.startswith("# Classification Statistics"):
+                break
+            if line.strip() == "":
+                continue
+            lines.append(line)
+            
+    if not lines:
+        raise ValueError(f"Input file is empty or invalid: {input_path}")
+        
+    csv_content = "".join(lines)
+    
+    delimiter, quotechar = _sniff_dialect(csv_content[:8192])
+    
+    df = pd.read_csv(io.StringIO(csv_content), sep=delimiter, quotechar=quotechar, dtype=str, keep_default_na=False)
+    
+    if "confidence" in df.columns and "legal_form" in df.columns:
+        df.loc[df["confidence"].str.lower() == "unknown", "legal_form"] = ""
+        
+    logger.info(f"Writing updated CSV: {output_path}")
+    df.to_csv(output_path, index=False, encoding="utf-8-sig", sep=";")
+    
+    pipeline = ClassificationPipeline(offline=True)
+    results = []
+    
+    def _safe_get(row_series, col_name, default_val=""):
+        return row_series.get(col_name) if col_name in row_series and pd.notna(row_series.get(col_name)) else default_val
+        
+    for _, row in df.iterrows():
+        results.append(ClassificationResult(
+            organisation_name=str(_safe_get(row, "organisation_name", "")),
+            legal_form=str(_safe_get(row, "legal_form", "")),
+            confidence=str(_safe_get(row, "confidence", "unknown")),
+            source=str(_safe_get(row, "source", "")),
+            link_to_src=str(_safe_get(row, "link_to_src", ""))
+        ))
+        
+    pipeline._log_statistics(results)
+    stats = pipeline._compute_statistics(results)
+    
+    try:
+        with output_path.open("a", encoding="utf-8-sig", newline="") as f:
+            f.write("\n# Classification Statistics\n")
+            f.write(f"Total;{stats['total']}\n")
+
+            f.write("\nBy confidence;count;percent\n")
+            for conf, count in stats["by_confidence"].items():
+                pct = (count / stats["total"]) * 100 if stats["total"] else 0.0
+                f.write(f"{conf};{count};{pct:.1f}%\n")
+
+            f.write("\nBy source;count;percent\n")
+            for src, count in stats["by_source"].items():
+                pct = (count / stats["total"]) * 100 if stats["total"] else 0.0
+                f.write(f"{src};{count};{pct:.1f}%\n")
+
+            f.write("\nBy legal_form;count;percent\n")
+            for lf, count in stats["forms_sorted"]:
+                pct = (count / stats["total"]) * 100 if stats["total"] else 0.0
+                f.write(f"{lf};{count};{pct:.1f}%\n")
+    except Exception as e:
+        logger.warning(f"Failed to append statistics to CSV: {e}")

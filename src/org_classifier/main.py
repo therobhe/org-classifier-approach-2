@@ -29,7 +29,16 @@ def _run_classify_sync(
     cache_dir: Optional[str],
     clear_cache: bool,
     with_heuristic: bool = False,
+    no_estimated_form: bool = False,
 ) -> None:
+    if no_estimated_form:
+        from .pipeline import remove_estimated_forms
+        typer.echo(f"Running in --no-estimated-form standalone mode")
+        typer.echo(f"Processing: {input_csv}")
+        remove_estimated_forms(input_csv, output_csv)
+        typer.echo(f"✓ Results written to: {output_csv}")
+        return
+
     async def run():
         pipeline_cache_dir = cache_dir or settings.cache_dir
         pipeline_max_workers = max_workers or settings.max_concurrent_requests
@@ -102,6 +111,11 @@ def main(
         "--with-heuristic",
         help="Enable heuristic classification stage",
     ),
+    no_estimated_form: bool = typer.Option(
+        False,
+        "--no-estimated-form",
+        help="Standalone mode to clear legal_form for 'unknown' confidence and regenerate stats",
+    ),
 ):
     """Default command.
 
@@ -132,6 +146,7 @@ def main(
         cache_dir=cache_dir,
         clear_cache=clear_cache,
         with_heuristic=with_heuristic,
+        no_estimated_form=no_estimated_form,
     )
 
 
@@ -171,6 +186,11 @@ def classify(
         False,
         "--clear-cache",
         help="Clear cache before processing"
+    ),
+    no_estimated_form: bool = typer.Option(
+        False,
+        "--no-estimated-form",
+        help="Standalone mode to clear legal_form for 'unknown' confidence and regenerate stats"
     )
 ):
     """
@@ -198,6 +218,7 @@ def classify(
         max_workers=max_workers,
         cache_dir=cache_dir,
         clear_cache=clear_cache,
+        no_estimated_form=no_estimated_form,
     )
 
 
