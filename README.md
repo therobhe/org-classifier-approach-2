@@ -40,6 +40,9 @@ org-classifier input.csv output.csv --max-workers 10 --cache-dir .mycache --colu
 
 # Clear cache before processing
 org-classifier input.csv output.csv --clear-cache
+
+# Start in venv
+./.venv/bin/python -m org_classifier.main ./data/input_src.csv ./data/enriched_output.csv 
 ```
 
 See **[QUICKSTART.md](documentation/QUICKSTART.md)** for detailed usage examples.
