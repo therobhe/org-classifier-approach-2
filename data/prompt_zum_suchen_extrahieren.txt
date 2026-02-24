@@ -1,1 +1,0 @@
-Finde die Rechtsform der deutschen Organisation [ORGANISATTION_NAME]. Gib nur folgendes JSON zurück: { "legal_form": [FOUND_RESULT], "src": [URL] }. Wenn unbekannt, nutze "unknown" für "legal_form" und "none" für "src". Erfinde keine Werte, halluziniere nicht.
