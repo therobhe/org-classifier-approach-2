@@ -42,20 +42,19 @@
                          │       │        │     │      │
                          │       │        │     ▼      │
                          │       │        │  ┌─────────────────┐
-                         │       │        │  │ STAGE 2:        │
-                         │       │        │  │ Web Search      │
-                         │       │        │  │ (Google)        │
+                         │       │        │  │ STAGE 2a:       │
+                         │       │        │  │ Batch Web LLM   │
+                         │       │        │  │ (Gemini/OpenAI) │
                          │       │        │  └────┬───────┬────┘
                          │       │        │       │       │
-                         │       │        │  FOUND│       │NOT FOUND
-                         │       │        │       │       │
+                         │       │        │ SUCCESS │       │QUOTA EXHAUSTED
                          │       │        │       ▼       │
                          │       │        │  ┌─────────────────┐
-                         │       │        │  │ Fetch Impressum │
-                         │       │        │  │ (httpx + BS4)   │
+                         │       │        │  │ URL Validation  │
+                         │       │        │  │ (async httpx)   │
                          │       │        │  └────┬───────┬────┘
                          │       │        │       │       │
-                         │       │        │  MATCH│       │NO MATCH
+                         │       │        │HTTP 200/301   │DEAD LINK
                          │       │        │       │       │
                          │       │        ├───────┘       │
                          │       │        │               │
@@ -82,7 +81,7 @@
                     │   ClassificationResult               │
                     │   • legal_form                       │
                     │   • confidence (high/medium/low/unk) │
-                    │   • source (name/url/heuristic/null) │
+                    │   • source (name/web/heuristic/null) │
                     └──────────────────┬───────────────────┘
                                        │
                                        │ Store in CACHE ───┘
@@ -93,6 +92,12 @@
                          └──────────┬──────────────┘
                                     │
                                     ▼
+                    ┌───────────────────────────────┐
+                    │ STAGE 5: Final Sanitize Step  │
+                    │  (Forces Canonical Names)     │
+                    └──────────┬────────────────────┘
+                               │
+                               ▼
                     ┌───────────────────────────────┐
                     │  Merge with input DataFrame   │
                     └──────────┬────────────────────┘
@@ -119,22 +124,23 @@
 - Confidence: High
 - Source: "name"
 
-### Stage 2: Web Search + Impressum (`web_search.py` + `impressum.py`)
+### Stage 2: Batch LLM Web Search (`pipeline.py`)
 
-- Google search for "Organisation Impressum"
-- Fetch top 1-3 results with httpx
-- Parse HTML with BeautifulSoup
-- Extract legal forms from text
+- Batches up to 50 unknown organizations per API call
+- Uses Google Gemini API as primary, OpenAI as fallback
+- LLM searches the web and returns JSON with legal form and source URL
+- Validates URLs asynchronously via HEAD/GET requests
 - Coverage: +15-25%
-- Speed: ~2 seconds per org
-- Confidence: High (in title/headings) or Medium (in body)
-- Source: Impressum URL
-- Skipped when: `--offline` flag set
+- Speed: Very fast (due to batching and async architecture)
+- Confidence: High/Medium (if validated) or Low (if dead link)
+- Source: "web_search" or "openai"
+- Skipped when: `--offline` flag set or quotas exhausted
 
 ### Stage 3: Heuristics (`heuristic.py`)
 
 - Keyword matching (verein→e.V., stiftung→Stiftung, etc.)
 - Conservative rules (low false positive rate)
+- Runs as a final pass on remaining failures/unknowns
 - Coverage: +5-10%
 - Speed: Instant
 - Confidence: Low
@@ -147,20 +153,26 @@
 - confidence: "unknown"
 - source: null
 
+### Stage 5: Final Sanitize Step (`utils.py` & `pipeline.py`)
+
+- Runs over all completed results just before writing the CSV
+- Ensures formats like "eingetragener Verein" are standardized to "e.V."
+- Prevents LLM hallucinations or variations from entering the final data
+
 ---
 
 ## Concurrency Control
 
 ```
 ┌──────────────────────────────────────────────┐
-│  asyncio.Semaphore (max_concurrent_requests) │
+│  RateLimiter (Tokens & Requests)             │
 │                                              │
 │  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐   │
-│  │Req 1│ │Req 2│ │Req 3│ │Req 4│ │Req 5│   │
+│  │Batch│ │Batch│ │Batch│ │Batch│ │Batch│   │
 │  └─────┘ └─────┘ └─────┘ └─────┘ └─────┘   │
 │                                              │
-│  ▲ Maximum 5 concurrent web requests         │
-│  ▲ Additional requests wait                  │
+│  ▲ Strict TPM (Tokens Per Minute) tracking   │
+│  ▲ Graceful backoffs via Tenacity            │
 └──────────────────────────────────────────────┘
 ```
 
@@ -193,15 +205,17 @@
 ┌──────────────────────────────────────┐
 │  Tenacity Retry Logic                │
 │                                      │
-│  Web Search:                         │
-│    • 3 attempts                      │
-│    • Exponential backoff: 2-10s      │
+│  Web LLM Search:                     │
+│    • Exponential backoff for 429     │
+│    • Tracks exact API quota limits   │
+│    • Early exit if completely empty  │
 │                                      │
-│  HTTP Fetch:                         │
+│  HTTP Validator:                     │
 │    • 2 attempts                      │
-│    • Exponential backoff: 2-5s       │
+│    • Follows redirects               │
 │                                      │
 │  On failure: Fall through to next    │
 │  stage (graceful degradation)        │
 └──────────────────────────────────────┘
 ```
+

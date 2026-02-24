@@ -1795,8 +1795,27 @@ def remove_estimated_forms(input_path: Path, output_path: Path) -> None:
     if "confidence" in df.columns and "legal_form" in df.columns:
         df.loc[df["confidence"].str.lower() == "unknown", "legal_form"] = ""
         
+        # Also apply the sanitization step here for consistency with the main pipeline
+        sanitized_count = 0
+        def _apply_sanitize(val):
+            nonlocal sanitized_count
+            if pd.isna(val) or not str(val).strip():
+                return val
+            orig = str(val)
+            if orig.lower() != "unknown":
+                sanitized = sanitize_legal_form(orig)
+                if sanitized and sanitized != orig:
+                    sanitized_count += 1
+                    return sanitized
+            return orig
+            
+        df["legal_form"] = df["legal_form"].apply(_apply_sanitize)
+        if sanitized_count:
+            logger.info(f"Sanitize pass: normalized {sanitized_count} legal forms")
+
     logger.info(f"Writing updated CSV: {output_path}")
     df.to_csv(output_path, index=False, encoding="utf-8-sig", sep=";")
+
     
     pipeline = ClassificationPipeline(offline=True)
     results = []
