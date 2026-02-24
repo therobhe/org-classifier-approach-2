@@ -5,11 +5,11 @@
 The pipeline implements a **confidence-based cascade** with four main stages:
 
 1. **Name Extraction (Regex)** – Fast, high-confidence, ~60-70% hit rate
-2. **Web Search + Impressum** – Medium coverage, slower (optional, skipped with `--offline`)
+2. **Batch Web Search URL Validation** – Intelligent LLM web batching for high throughput handling of edge-cases (skipped with `--offline`)
 3. **Heuristics** – Low-confidence fallback
-4. **Null Assignment** – Unknown cases
+4. **Final Sanitization** – Enforces canonical abbreviations before CSV write
 
-All stages are orchestrated asynchronously for high throughput and robust error handling.
+All stages are orchestrated asynchronously for maximum throughput and robust rate limit handling.
 
 ---
 
@@ -21,25 +21,23 @@ All stages are orchestrated asynchronously for high throughput and robust error 
 - Regex patterns use word boundaries (`\b`) and are case-insensitive
 - Easy to extend with new forms
 
-### 2. Async Architecture
+### 2. Batch LLM Processing
 
-- Uses `asyncio` and `httpx.AsyncClient` for concurrent web requests
-- `asyncio.Semaphore` limits concurrent requests (default: 5)
-- All I/O operations (web, disk cache) are async for maximum throughput
+- Groups 50 unknown organisations at a time directly to Gemini or OpenAI.
+- Uses strict rate limits logic (TPM/RPM) via `RateLimiter` classes.
+- Validates URLs dynamically before assigning a confidence score to prevent LLM hallucination.
 
-### 3. Caching Strategy (`cache.py`)
+### 3. Caching & Checkpoints (`cache.py`)
 
 - Disk-based cache using `diskcache` (survives restarts)
-- Keys are normalized: `org:<lowercase_trimmed_name>`
-- Avoids redundant web searches across runs
-- Can be cleared with `--clear-cache` flag
+- Intermediate CSVs are dumped every 50 batches to guarantee data safety.
+- Single unified cache key format: `org:<lowercase_trimmed_name>`
 
-### 4. Error Handling
+### 4. Custom Error Handling & Quota tracking
 
-- Tenacity library for automatic retries (exponential backoff)
-- Web search: 3 attempts, 2-10s backoff
-- Page fetch: 2 attempts, 2-5s backoff
-- Failures gracefully fall through to next stage
+- Built completely robust handling of 429 Too Many Requests errors.
+- Automatic Fallback from Google Gemini to OpenAI if primary API gets exhausted.
+- URL validations are async with automatic redirect handling.
 
 ### 5. Offline Mode
 
@@ -51,6 +49,7 @@ All stages are orchestrated asynchronously for high throughput and robust error 
 
 - Uses `tqdm` for progress bar during batch processing
 - Logs statistics after completion (confidence/source breakdown)
+- Appends clean tables to the bottom of output CSVs.
 
 ---
 
@@ -65,12 +64,11 @@ Input: "Deutsche Bank AG"
 Input: "Berliner Verein für Kultur"
   ├─ Cache? No
   ├─ Name extraction? No
-  ├─ Web search? (if online)
-  │   ├─ Google: "Berliner Verein für Kultur Impressum"
-  │   ├─ Fetch top result
-  │   └─ Parse: Found "e.V." → (high/medium, <url>)
-  ├─ Heuristics? "verein" → e.V. (low, heuristic)
-  └─ Result: e.V., low, heuristic
+  ├─ Batched Web search? (if online)
+  │   ├─ Prompted Gemini (batch of 50): "{... organisations ...}"
+  │   ├─ Returns: "e.V.", src: "www.berliner-kultur.de/impressum"
+  │   └─ Validates URL: HTTP 200 OK → (medium, web_search, <url>)
+  └─ Result: e.V., medium, web_search, url
 ```
 
 ---
@@ -80,32 +78,26 @@ Input: "Berliner Verein für Kultur"
 | Stage           | Coverage  | Speed   | Confidence  |
 | --------------- | --------- | ------- | ----------- |
 | Name extraction | 60-70%    | Instant | High        |
-| Web + Impressum | 15-25%    | ~2s/org | High/Medium |
+| Batch LLM       | 15-25%    | Very Fast | Medium/Low  |
 | Heuristics      | 5-10%     | Instant | Low         |
 | Unknown         | Remaining | Instant | Unknown     |
 
 **Throughput estimates:**
 
 - Offline mode: 10,000+ orgs/second
-- Online mode: ~150-300 orgs/minute (rate-limited)
+- Online mode: Purely dependent on API Token limits. With max-limits, hits 10k orgs in a few minutes.
 
 ---
 
 ## Extensibility & Future Enhancements
 
-### 1. Web Search API Choice
+### 1. LLM Parameter Tuning
+- Batch sizes can be varied based on API token limits.
 
-- **Current:** `googlesearch-python` (free, fragile, rate-limited)
-- **Alternatives:** SerpAPI, Searx, Bing Search API (recommended for production)
-
-### 2. LLM Fallback Stage
-
-- Optional: Add GPT-4o/local-LLM between heuristics and null-assignment
-- Would boost recall on ambiguous cases
-- Not implemented by default (see docs for example implementation)
+### 2. Advanced Link Text Scraping
+- Currently URL validation only checks for HTTP 200/301 statuses. We could optionally pull the text of the link to doubly verify the LLM hallucination.
 
 ### 3. Handelsregister Lookup
-
 - Optional: Integrate offeneregister.de API as authoritative source
 - Add as Stage 1.5 (after name, before web search)
 
@@ -119,6 +111,13 @@ Input: "Berliner Verein für Kultur"
 pip install -e .
 ```
 
+### Setup keys
+Set `.env` file keys
+```env
+GEMINI_API_KEY=ABC
+OPENAI_API_KEY=DEF
+```
+
 ### Basic Usage
 
 ```bash
@@ -127,9 +126,6 @@ org-classifier input.csv output.csv --offline
 
 # Online mode (slower, ~85% coverage)
 org-classifier input.csv output.csv
-
-# Custom settings
-org-classifier input.csv output.csv --max-workers 10 --cache-dir .mycache
 ```
 
 ### Test
@@ -151,13 +147,13 @@ Deutsche Bank AG
 FC Bayern München e.V.
 ```
 
-**Output:**
+**Output (Semicolon separated):**
 
 ```csv
-organisation_name,legal_form,confidence,source
-Siemens AG,AG,high,name
-Deutsche Bank AG,AG,high,name
-FC Bayern München e.V.,e.V.,high,name
+organisation_name;legal_form;confidence;source;link_to_src
+Siemens AG;AG;high;name;
+Deutsche Bank AG;AG;high;name;
+FC Bayern München e.V.;e.V.;high;name;
 ```
 
 ---
@@ -166,8 +162,7 @@ FC Bayern München e.V.,e.V.,high,name
 
 - pandas – CSV I/O
 - httpx – Async HTTP client
-- beautifulsoup4 + lxml – HTML parsing
-- googlesearch-python – Web search
+- google-genai / openai - APIs
 - diskcache – Persistent caching
 - tenacity – Retry logic
 - pydantic – Data validation
@@ -180,6 +175,5 @@ FC Bayern München e.V.,e.V.,high,name
 
 1. **Test with real data** – Run on sample dataset, measure accuracy
 2. **Add Handelsregister stage** – Integrate offeneregister.de API
-3. **Improve heuristics** – Add more conservative keyword rules
-4. **Consider LLM fallback** – For production use with high accuracy requirements
-5. **Switch to paid search API** – If processing >10k organisations
+3. **Consider scraping API** – For completely authoritative non-LLM solutions.
+
